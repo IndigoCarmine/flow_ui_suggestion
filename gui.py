@@ -5,69 +5,7 @@ from PySide6 import QtCore, QtWidgets
 import base
 
 
-class Read(base.Read):
-    def run_interaction(self, runner):
-        prompt = self.resolve_content(runner.data)
-        label = QtWidgets.QLabel(str(prompt))
-        line_edit = QtWidgets.QLineEdit()
-        line_edit.textChanged.connect(lambda text: self.apply_update(runner.data, text))
-        runner.display_widgets([label, line_edit], self)
-
-
-class Write(base.Write):
-    def run_interaction(self, runner):
-        content = self.resolve_content(runner.data)
-        label = QtWidgets.QLabel(str(content))
-        runner.display_widgets([label], self)
-
-
-class Choice(base.Choice):
-    def run_interaction(self, runner):
-        choices = self.resolve_content(runner.data) or self.choices
-        combo = QtWidgets.QComboBox()
-        combo.addItems(choices)
-        combo.currentIndexChanged.connect(
-            lambda idx: self.apply_update(runner.data, choices[idx])
-        )
-        runner.display_widgets([combo], self)
-
-
-class Combine(base.Combine):
-    def run_interaction(self, runner):
-        widgets = []
-        for flow in self.flows:
-            if isinstance(flow, base.Read):
-                p = flow.resolve_content(runner.data)
-                widgets.append(QtWidgets.QLabel(str(p)))
-                le = QtWidgets.QLineEdit()
-                le.textChanged.connect(lambda t, f=flow: f.apply_update(runner.data, t))
-                widgets.append(le)
-            elif isinstance(flow, base.Write):
-                c = flow.resolve_content(runner.data)
-                widgets.append(QtWidgets.QLabel(str(c)))
-        runner.display_widgets(widgets, self)
-
-
-class LinearCombine(base.LinearCombine):
-    def run_interaction(self, runner):
-        for flow in self.flows:
-            flow.is_complete = False
-            # Ensure internal flows use the backend implementation logic
-            # By wrapping them in the appropriate backend class if needed,
-            # but since we create them from the backend module in main.py, it's fine.
-            flow.run_interaction(runner)
-        self.complete()
-
-
-class Start(base.Start):
-    pass
-
-
-class End(base.End):
-    pass
-
-
-class ApplicationRunner(base.ApplicationRunnerBase):
+class GuiRunner(base.ApplicationRunnerBase):
     def __init__(self, data=None):
         super().__init__(data)
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
@@ -78,6 +16,40 @@ class ApplicationRunner(base.ApplicationRunnerBase):
         self.layout = QtWidgets.QVBoxLayout(self.central_widget)
         self.main_window.resize(400, 300)
         self.main_window.show()
+
+    def show_read(self, flow):
+        self.display_widgets(self._read_widgets(flow), flow)
+
+    def show_write(self, flow):
+        self.display_widgets(self._write_widgets(flow), flow)
+
+    def show_choice(self, flow):
+        choices = flow.resolve_content(self.data) or flow.choices
+        combo = QtWidgets.QComboBox()
+        combo.addItems(choices)
+        combo.currentIndexChanged.connect(
+            lambda idx: flow.apply_update(self.data, choices[idx])
+        )
+        self.display_widgets([combo], flow)
+
+    def show_combine(self, flow):
+        widgets = []
+        for child in flow.flows:
+            if isinstance(child, base.Read):
+                widgets += self._read_widgets(child)
+            elif isinstance(child, base.Write):
+                widgets += self._write_widgets(child)
+        self.display_widgets(widgets, flow)
+
+    def _read_widgets(self, flow: base.Read) -> list[QtWidgets.QWidget]:
+        content = flow.resolve_content(self.data)
+        return [QtWidgets.QLabel(str(content))]
+
+    def _write_widgets(self, flow: base.Write) -> list[QtWidgets.QWidget]:
+        prompt = flow.resolve_content(self.data)
+        line_edit = QtWidgets.QLineEdit()
+        line_edit.textChanged.connect(lambda text: flow.apply_update(self.data, text))
+        return [QtWidgets.QLabel(str(prompt)), line_edit]
 
     def display_widgets(self, widgets, flow):
         while self.layout.count():

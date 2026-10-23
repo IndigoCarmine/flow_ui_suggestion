@@ -1,12 +1,7 @@
 from dataclasses import dataclass
 
 import base
-
-# GUIを使う場合はこちら
-import gui as ui
-
-# CUIを使う場合はこちら
-# import cui as ui
+import cui
 
 
 @dataclass(slots=True)
@@ -30,31 +25,36 @@ def build_greeting(data: UserData) -> str:
 
 def build_registration_steps() -> list[base.MiniFlow]:
     return [
-        ui.Read(None, None, "Enter your name", "Name").data_update(update_name),
-        ui.Read(None, None, "Enter your age", "Age").data_update(update_age_text),
-        ui.Write(None, None, "Thank you!", "Thanks").context_build(build_greeting),
+        base.Write(None, None, "Enter your name", "Name").data_update(update_name),
+        base.Write(None, None, "Enter your age", "Age").data_update(update_age_text),
+        base.Read(None, None, "Thank you!", "Thanks").context_build(build_greeting),
     ]
 
 
-def build_app(data: UserData) -> ui.ApplicationRunner:
-    start = ui.Start("MainStart")
+def build_app(runner: base.ApplicationRunnerBase) -> base.ApplicationRunnerBase:
+    start = base.Start("MainStart")
     middle = base.State("MiddleState")
-    end = ui.End("MainEnd")
+    end = base.End("MainEnd")
 
     flows: list[base.MiniFlow] = [
-        ui.LinearCombine(start, middle, build_registration_steps(), "RegistrationProcess"),
-        ui.Write(middle, end, "Process Complete", "EndMessage"),
+        base.LinearCombine(start, middle, build_registration_steps(), "RegistrationProcess"),
+        base.Read(middle, end, "Process Complete", "EndMessage"),
     ]
 
-    app = ui.ApplicationRunner(data=data)
     for flow in flows:
-        app.add_miniflow(flow)
-    return app
+        runner.add_miniflow(flow)
+    return runner
 
 
 def main() -> None:
-    app = build_app(UserData())
-    app.run()
+    data = UserData()
+    # GUIを使う場合はこちら（PySide6はGUI選択時のみ読み込む）
+    import gui
+
+    runner = gui.GuiRunner(data)
+    # CUIを使う場合はこちら
+    # runner = cui.CuiRunner(data)
+    build_app(runner).run()
 
 
 if __name__ == "__main__":

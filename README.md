@@ -48,8 +48,8 @@ runner.run()
 
 - **State (状態)**: アプリケーションの特定の瞬間を表すチェックポイントです（Start, Endなど）。
 - **MiniFlow (インタラクション)**: 状態間の遷移（エッジ）であり、ユーザーとの対話を定義します。
-    - `Read`: ユーザーからの情報入力を要求します。
-    - `Write`: ユーザーへの情報提示を行います。
+    - `Read`: ユーザーが読む＝ユーザーへの情報提示を行います。
+    - `Write`: ユーザーが書く＝ユーザーからの情報入力を要求します。
     - `Choice`: 選択肢を提示します。
     - `LinearCombine`: 複数の対話を一続きのシーケンスとして実行します。
 - **DataContext**: 状態間で共有されるデータコンテキストです。`data_update`（書き込み）と `context_build`（読み出し・構築）を通じて、型安全にデータを扱えます。
@@ -57,6 +57,6 @@ runner.run()
 ## 4. アーキテクチャ
 プロジェクトは以下の3つのレイヤーで構成されています。
 
-1.  **Core (`base.py`)**: グラフ構造、インタラクションの抽象定義、データ管理ロジックを保持します。特定のプラットフォームには依存しません。
-2.  **Backends (`gui.py`, `cui.py`)**: 抽象的なインタラクションを、具体的なUI部品（QWidgetやprint/input）に変換します。
-3.  **App Logic (`main.py`)**: 開発者がフローを記述するエントリポイントです。バックエンドのインポートを切り替えるだけで、同一のロジックを異なる環境で動作させることができます。
+1.  **Core (`base.py`)**: State・MiniFlow（`Read`, `Write`, `Choice`, `Combine`, `LinearCombine`）とデータ管理ロジックを保持します。MiniFlowは描画方法を持たない純粋なデータです。Runner基底クラス（`ApplicationRunnerBase`）がステートマシンのループを回し、各MiniFlowを種類ごとの描画メソッド（`show_read`, `show_write`, ...）に振り分けます。特定のプラットフォームには依存しません。
+2.  **Backends (`gui.py`, `cui.py`)**: Runner（`GuiRunner`, `CuiRunner`）だけを提供し、描画メソッドを具体的なUI部品（QWidgetやprint/input）で実装します。`Combine`の子をまとめて表示する処理もRunnerが担当します。
+3.  **App Logic (`main.py`)**: 開発者が`base`のクラスだけでフローを記述するエントリポイントです。どのRunnerを生成するかを切り替えるだけで、同一のロジックを異なる環境で動作させることができます。

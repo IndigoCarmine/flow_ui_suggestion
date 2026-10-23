@@ -19,7 +19,9 @@ class End(State):
     pass
 
 
-class MiniFlow(abc.ABC):
+class MiniFlow:
+    """Backend-independent step. It only holds data; the runner decides how to render it."""
+
     def __init__(self, begin_state: State, end_state: State, message: str, name: str):
         self.name = name
         self.begin_state = begin_state
@@ -80,10 +82,6 @@ class MiniFlow(abc.ABC):
     def complete(self):
         self.is_complete = True
 
-    @abc.abstractmethod
-    def run_interaction(self, runner: "ApplicationRunnerBase"):
-        pass
-
 
 class ApplicationRunnerBase(abc.ABC):
     def __init__(self, data: Any = None):
@@ -119,9 +117,44 @@ class ApplicationRunnerBase(abc.ABC):
             if len(available_flows) > 1:
                 selected_flow = self.select_flow(available_flows)
 
-            selected_flow.is_complete = False
-            selected_flow.run_interaction(self)
+            self.render(selected_flow)
             self.current_state = selected_flow.end_state
+
+    def render(self, flow: MiniFlow):
+        flow.is_complete = False
+        if isinstance(flow, Read):
+            self.show_read(flow)
+        elif isinstance(flow, Write):
+            self.show_write(flow)
+        elif isinstance(flow, Choice):
+            self.show_choice(flow)
+        elif isinstance(flow, Combine):
+            self.show_combine(flow)
+        elif isinstance(flow, LinearCombine):
+            self.show_linear_combine(flow)
+        else:
+            raise TypeError(f"Unknown flow type: {type(flow).__name__}")
+
+    def show_linear_combine(self, flow: "LinearCombine"):
+        for child in flow.flows:
+            self.render(child)
+        flow.complete()
+
+    @abc.abstractmethod
+    def show_read(self, flow: "Read"):
+        """Display information to the user."""
+
+    @abc.abstractmethod
+    def show_write(self, flow: "Write"):
+        """Take input from the user."""
+
+    @abc.abstractmethod
+    def show_choice(self, flow: "Choice"):
+        pass
+
+    @abc.abstractmethod
+    def show_combine(self, flow: "Combine"):
+        """Show all child flows together."""
 
     @abc.abstractmethod
     def select_flow(self, flows: list[MiniFlow]) -> MiniFlow:
@@ -129,11 +162,11 @@ class ApplicationRunnerBase(abc.ABC):
 
 
 class Read(MiniFlow):
-    pass
+    """The user reads: the app displays information."""
 
 
 class Write(MiniFlow):
-    pass
+    """The user writes: the app takes input."""
 
 
 class Choice(MiniFlow):
