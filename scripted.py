@@ -12,9 +12,12 @@ class ScriptExhausted(RuntimeError):
 class ScriptedRunner(base.ApplicationRunnerBase):
     """Runs an app without a user.
 
-    answers: consumed in order. A Write takes the text to enter, a Choice takes one of its choice
-    values, and a selection (several flows/commands available) takes the flow or command name.
-    transcript: list of (kind, name, text) tuples, kind is "read", "write", "choice", "select" or "warning".
+    answers: consumed in order. A Write takes what the user would enter (text, or an already typed value
+    such as 30 or True; it is converted and validated by the Write's kind and validate, and a rejected
+    answer raises base.InvalidInput with the message), a Choice takes one of its choice values, and a
+    selection (several flows/commands available) takes the flow or command name.
+    transcript: list of (kind, name, value) tuples, kind is "read", "write", "choice", "select" or "warning".
+    For "write" the value is the converted one (e.g. an int for Number).
     """
 
     def __init__(self, data: Any = None, answers: Iterable[Any] = ()):
@@ -39,12 +42,17 @@ class ScriptedRunner(base.ApplicationRunnerBase):
             self.transcript.append(("warning", "", problem))
 
     def show_read(self, flow):
-        self._read(flow)
-        flow.complete()
+        self.transcript.append(("read", flow.name, flow.resolve_content(self.data)))
 
     def show_write(self, flow):
-        self._write(flow)
-        flow.complete()
+        prompt = flow.resolve_content(self.data)
+        answer = self._next(f"Write '{flow.name}' ({prompt})")
+        try:
+            value = flow.accept(answer, self.data)
+        except base.InvalidInput as e:
+            raise base.InvalidInput(f"scripted answer {answer!r} for Write '{flow.name}' was rejected: {e}") from None
+        self.transcript.append(("write", flow.name, value))
+        flow.apply_update(self.data, value)
 
     def show_choice(self, flow):
         choices = list(flow.resolve_content(self.data) or flow.choices)
@@ -53,24 +61,11 @@ class ScriptedRunner(base.ApplicationRunnerBase):
             raise ValueError(f"scripted answer {answer!r} is not one of the choices {choices!r} of '{flow.name}'")
         self.transcript.append(("choice", flow.name, answer))
         flow.apply_update(self.data, answer)
-        flow.complete()
 
     def show_combine(self, flow):
+        # Without a screen, "shown together" is the same as one after another.
         for child in flow.flows:
-            if isinstance(child, base.Read):
-                self._read(child)
-            elif isinstance(child, base.Write):
-                self._write(child)
-        flow.complete()
-
-    def _read(self, flow):
-        self.transcript.append(("read", flow.name, flow.resolve_content(self.data)))
-
-    def _write(self, flow):
-        prompt = flow.resolve_content(self.data)
-        value = self._next(f"Write '{flow.name}' ({prompt})")
-        self.transcript.append(("write", flow.name, value))
-        flow.apply_update(self.data, value)
+            self.render(child)
 
     def select_flow(self, flows, commands):
         names = [f.name for f in flows] + [c.name for c in commands]

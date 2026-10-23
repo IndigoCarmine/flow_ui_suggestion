@@ -17,10 +17,12 @@ Flow UI Frameworkは、アプリケーションの振る舞いを「状態（Sta
 - **Start**: アプリケーションの開始点。
 - **End**: アプリケーションの終了点。
 - **Custom State**: ユーザー定義の状態。
-- **同一性**: 名前付きのStateは（型, 名前）で等価・ハッシュを決める（`State("home") == State("home")`、`LoggedIn("home") != State("home")`）。名前の無い `State()` は自分自身とだけ等しい。`Start` と `End` はそれぞれ1つだけのインスタンスで（`Start() is Start("x")`）、名前は表示用。`Return()` はStateではなく、どのStateとも等しくない。
+- **同一性**: 名前付きのStateは（型, 名前）で等価・ハッシュを決める（`State("home") == State("home")`、`LoggedIn("home") != State("home")`）。名前の無い `State()` は自分自身とだけ等しい。`Start` と `End` はそれぞれ1つだけのインスタンスで（`Start() is Start("x")`）、表示名は "Start" / "End" に固定（引数の名前は無視し、共有インスタンスの名前を書き換えない）。`Return()` はStateではなく、どのStateとも等しくない。
 
 ### 3.2 MiniFlow（インターフェース/遷移）
 あるStateから別のStateへの遷移を定義し、その過程で発生するユーザーインタラクションを保持する。
+- **生成**: 最初の位置引数は内容（Read/Writeは文、Choiceは選択肢、Combine/LinearCombineは子のリスト）で、`name` などはキーワード（例: `Write("年齢", name="Age")`）。最初の位置引数がState・Stateの型・Noneなら旧来の `(begin, end, 内容, name)` の形として扱う。`name` を省略すると文（無ければクラス名）を名前にする。
+- **純粋なデータ**: MiniFlowは実行中の進行状態を持たない（完了待ちはRunnerが管理する）。同じMiniFlowを何度でも、複数のRunnerで使える。
 - **属性**:
   - `name`: 遷移の識別子。
   - `begin_state`: 遷移の開始。`begin(state_or_type)` / `begin_end(begin, end)` でも設定できる。
@@ -39,7 +41,20 @@ MiniFlowの具体的な実装として、以下の基本インタラクション
 - **Read (出力)**: ユーザーに情報を提示する（例：テキスト表示、画像表示）。
 - **Write (入力)**: ユーザーから情報を受け取る（例：テキスト入力、数値入力）。
 - **Choice (選択)**: 提示された選択肢から一つを選択させる。
-- **Combine (複合)**: 複数のインタラクションを一つのMiniFlowとしてまとめ、同時に、あるいは順次提示する。
+- **Combine (複合)**: 複数のインタラクションを一つのMiniFlowとしてまとめ、同時に（`Combine`）、あるいは順次（`LinearCombine`）提示する。子にはどのインタラクション（入れ子のCombineを含む）も置ける。Runnerが扱えない子は黙って飛ばさず、エラーにする。
+
+### 4.1 入力の種類（kind）
+`Write(..., kind=...)` は「どんな値が欲しいか」という意図であり、ウィジェットの指定ではない。Runnerが入力方法を決め、`data_update` には変換済みの値を渡す。
+- `Text(required=False)`（既定）: str。`required=True` なら空白だけの入力を拒否する。
+- `Password(required=False)`: 入力中に表示しないstr（CUIは `getpass`、ただしstdinが端末でなければ通常の入力。GUIは伏せ字の入力欄）。
+- `Number(min=None, max=None, decimals=0)`: `decimals=0` ならint、それ以外はfloat。範囲外・数でない入力を拒否する（GUIはスピンボックス）。
+- `YesNo()`: bool。文字列なら y/yes/true/1 と n/no/false/0（GUIはチェックボックス）。
+- 独自のkindは `Kind` を継承し、`convert(raw)`（失敗時は `ValueError(メッセージ)`）と `check(value)`（エラーメッセージかNone）を実装する。
+
+### 4.2 入力の検証（validate）
+- `Write(..., validate=f)`: `f(value)` または `f(data, value)` がエラーメッセージ（またはNone）を返す。
+- 順序: kindの変換 → kindの検査 → `validate`。`Write.accept(raw, data)` が値を返すか `InvalidInput(メッセージ)` を送出する。
+- 拒否された場合、Runnerはメッセージを示して聞き直す（CUIはメッセージを表示して再入力、GUIは画面を保ったまま入力欄の下に表示、ScriptedRunnerはメッセージ付きの `InvalidInput` を送出）。拒否された値は `data_update` に渡さない。GUIのCombineでは、全ての入力が受け入れられたときだけまとめて `data_update` する。
 
 ## 5. Runtime（実行時エンジン）の役割
 
@@ -58,9 +73,11 @@ Runtimeは、定義されたグラフを解釈し、実際のプラットフォ�
    - 明示的なフローが1つでコマンドが無い場合：その `MiniFlow` を自動で実行する。
    - それ以外で候補がある場合：Runnerの `select_flow(flows, commands)` でユーザーに選ばせる。コマンドは必ずユーザーが選ぶ（自動実行すると同じコマンドが繰り返されるため）。BackendはコマンドをCUIならプロンプト、GUIなら別のボタン列のように通常のフローと区別して表示してよい。
    - 候補が無い場合：停止する。
-3. `MiniFlow` のインタラクション（表示・入力）が完了するまで待機する。
+3. `MiniFlow` のインタラクション（表示・入力）が完了するまで待機する（入力は受け入れられるまで聞き直す）。
 4. インタラクション完了後、`end_state` から次の状態を決める（`Branch` なら `check` を評価し、`None`/`Return()` ならフローを始めた状態に戻る）。
 5. 現在の状態が `End` に達するまで 2-4 を繰り返す。
+
+- `context_build` の文字列: `{...}` を含めばdataの属性/キーで埋めるテンプレート（欠けていれば `message`）。含まなければ、dataの属性/キー名ならその値、そうでなければそのままの文として表示する。
 
 ## 7. 静的検査
 Runnerは実行前にグラフを検査できる。
@@ -71,6 +88,6 @@ Runnerは実行前にグラフを検査できる。
 ## 8. Runtimeの選択
 - `runtime.run(build_app, data, backend=None)` / `runtime.make_runner(data, backend=None)`。
 - 優先順位: 引数 `backend` > コマンドライン `--cui` / `--gui` > 環境変数 `FLOW_UI_BACKEND` > 自動判定。
-- 自動判定: 画面があり（Linux等では `DISPLAY` か `WAYLAND_DISPLAY`、macOS/Windowsは常にあるとみなす）、PySide6が読み込めればGUI、そうでなければCUI。GUIモジュールは選ばれたときだけ読み込む。
+- 自動判定: 画面があり（Linux等では `DISPLAY` か `WAYLAND_DISPLAY`、macOS/Windowsは常にあるとみなす）、PySide6が読み込めればGUI、そうでなければCUI。画面があるのにPySide6の読み込みに失敗した場合は、理由を標準エラー出力に1行出す。GUIモジュールは選ばれたときだけ読み込む。
 - アプリのコードは `base` と `runtime` だけを使い、Backendを直接importしない。
-- `scripted.ScriptedRunner(data, answers)` は画面を持たないBackendで、決められた答えで実行し、表示内容を `transcript` に記録する（テスト用）。答えが尽きると `ScriptExhausted`。
+- `scripted.ScriptedRunner(data, answers)` は画面を持たないBackendで、決められた答えで実行し、表示内容を `transcript` に記録する（テスト用）。答えが尽きると `ScriptExhausted`。Writeの答えはkind・validateで変換・検査し、拒否されれば `InvalidInput`。

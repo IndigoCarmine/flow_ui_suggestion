@@ -1,7 +1,8 @@
 """Pick a backend (Runner) without changing app code.
 
 Order: `backend` argument > `--cui`/`--gui` in argv > env `FLOW_UI_BACKEND` > auto detection.
-Auto: GUI if a display is available and PySide6 can be imported, otherwise CUI.
+Auto: GUI if a display is available and PySide6 can be imported, otherwise CUI
+(with a one-line note on stderr when a display exists but the PySide6 import failed).
 The GUI module (PySide6) is only imported when the GUI is chosen.
 """
 
@@ -23,11 +24,13 @@ def has_display() -> bool:
 
 
 def gui_available() -> bool:
+    """A display exists and PySide6 imports. If only the import fails, say why on stderr (one line)."""
     if not has_display():
         return False
     try:
         import PySide6.QtWidgets  # noqa: F401
-    except ImportError:
+    except ImportError as e:
+        print(f"flow-ui: a display was found but PySide6 could not be imported ({e}); using CUI", file=sys.stderr)
         return False
     return True
 

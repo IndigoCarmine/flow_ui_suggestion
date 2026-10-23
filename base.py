@@ -1,7 +1,7 @@
 import abc
 import inspect
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any, Callable, Optional, Union
 
 
@@ -35,30 +35,35 @@ class State:
 
 
 class _UniqueState(State):
-    """A state with exactly one instance per class. The name is cosmetic (the last one given is kept)."""
+    """A state with exactly one instance per class. Its display name is the class name ("Start"/"End").
+
+    A name argument is accepted for compatibility but ignored, so one call can't rename the shared instance.
+    """
 
     def __new__(cls, name: Optional[str] = None):
         instance = cls.__dict__.get("_instance")
         if instance is None:
             instance = super().__new__(cls)
-            instance.name = None
+            instance.name = cls.__name__
             cls._instance = instance
         return instance
 
     def __init__(self, name: Optional[str] = None):
-        if name is not None:
-            self.name = name
+        pass
 
     def _key(self):
         return (type(self),)
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
 
 class Start(_UniqueState):
-    """The start of the app. `Start()` and `Start("name")` are always the same object."""
+    """The start of the app. `Start()` and `Start("name")` are always the same object, named "Start"."""
 
 
 class End(_UniqueState):
-    """The end of the app. `End()` and `End("name")` are always the same object."""
+    """The end of the app. `End()` and `End("name")` are always the same object, named "End"."""
 
 
 class Return:
@@ -97,6 +102,153 @@ def _call_with_data(func: Callable, data: Any):
     return func(data)
 
 
+# --- input kinds: what kind of value a Write asks for (the runner picks the widget) ---------------
+
+
+class InvalidInput(ValueError):
+    """What the user entered was rejected. The message is meant to be shown to the user."""
+
+
+class Kind:
+    """What kind of value a Write asks for. Runners choose how to ask; the kind converts and checks.
+
+    convert(raw): turn what was entered (text, or an already typed value from a widget) into the value;
+    raise ValueError(message) if it can't. check(value): built-in validation, an error message or None.
+    """
+
+    def convert(self, raw: Any) -> Any:
+        return raw
+
+    def check(self, value: Any) -> Optional[str]:
+        return None
+
+    def __repr__(self):
+        args = ", ".join(f"{k}={v!r}" for k, v in vars(self).items())
+        return f"{self.__class__.__name__}({args})"
+
+
+class Text(Kind):
+    """Free text (the default). `required=True` rejects empty or blank input."""
+
+    def __init__(self, required: bool = False):
+        self.required = required
+
+    def convert(self, raw: Any) -> str:
+        return "" if raw is None else str(raw)
+
+    def check(self, value: str) -> Optional[str]:
+        if self.required and not value.strip():
+            return "a value is required"
+        return None
+
+
+class Password(Text):
+    """Text that should not be shown while it is entered."""
+
+
+class Number(Kind):
+    """A number between `min` and `max` (both optional). `decimals=0` (default) gives an int, otherwise a float."""
+
+    def __init__(self, min: Optional[float] = None, max: Optional[float] = None, decimals: int = 0):
+        self.min = min
+        self.max = max
+        self.decimals = decimals
+
+    def convert(self, raw: Any) -> Union[int, float]:
+        whole = self.decimals == 0
+        if isinstance(raw, bool):
+            raise ValueError("enter a number")
+        if isinstance(raw, (int, float)):
+            value = raw
+        else:
+            text = "" if raw is None else str(raw).strip()
+            try:
+                value = int(text) if whole else float(text)
+            except ValueError:
+                raise ValueError("enter a whole number" if whole else "enter a number") from None
+        if whole:
+            if not float(value).is_integer():
+                raise ValueError("enter a whole number")
+            return int(value)
+        return float(value)
+
+    def check(self, value: Union[int, float]) -> Optional[str]:
+        low_ok = self.min is None or value >= self.min
+        high_ok = self.max is None or value <= self.max
+        if low_ok and high_ok:
+            return None
+        if self.min is not None and self.max is not None:
+            return f"enter a number from {self.min} to {self.max}"
+        if not low_ok:
+            return f"enter a number of at least {self.min}"
+        return f"enter a number of at most {self.max}"
+
+
+class YesNo(Kind):
+    """A yes/no answer, converted to bool. Text answers: y/yes/true/1 and n/no/false/0 (any case)."""
+
+    YES = ("y", "yes", "true", "1")
+    NO = ("n", "no", "false", "0")
+
+    def convert(self, raw: Any) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        text = "" if raw is None else str(raw).strip().lower()
+        if text in self.YES:
+            return True
+        if text in self.NO:
+            return False
+        raise ValueError("answer yes or no (y/n)")
+
+
+def _as_kind(kind: Union[Kind, type, None]) -> Kind:
+    if kind is None:
+        return Text()
+    if isinstance(kind, type) and issubclass(kind, Kind):
+        return kind()
+    if not isinstance(kind, Kind):
+        raise TypeError(f"kind must be a Kind such as Text(), Password(), Number() or YesNo(), not {kind!r}")
+    return kind
+
+
+# --- constructor arguments ------------------------------------------------------------------------
+
+_UNSET: Any = object()
+
+
+def _is_begin(arg: Any) -> bool:
+    return arg is None or isinstance(arg, State) or (isinstance(arg, type) and issubclass(arg, State))
+
+
+def _bind_args(cls_name: str, content_key: str, args: tuple, given: dict) -> dict:
+    """Accept both `Step(content, name=...)` and the old `Step(begin, end, content, name)` positional form.
+
+    The old form is detected by a State, a State subclass or None as the first positional argument.
+    """
+    if args:
+        if _is_begin(args[0]):
+            keys = ["begin_state", "end_state", content_key, "name"]
+        else:
+            keys = [content_key]
+        if len(args) > len(keys):
+            form = "(begin, end, " + content_key + ", name)" if len(keys) > 1 else f"({content_key}, name=...)"
+            raise TypeError(f"{cls_name}{form} takes at most {len(keys)} positional argument{"s" if len(keys) > 1 else ""} ({len(args)} given)")
+        for key, value in zip(keys, args):
+            if given[key] is not _UNSET:
+                raise TypeError(f"{cls_name}() got multiple values for '{key}'")
+            given[key] = value
+    return given
+
+
+def _lookup(data: Any, key: str) -> tuple[bool, Any]:
+    if isinstance(data, Mapping):
+        return (key in data, data.get(key))
+    try:
+        return (True, getattr(data, key))
+    except AttributeError:
+        return (False, None)
+
+
 class _Fields:
     """Lets `str.format_map` read fields from a dict, a dataclass (also with slots=True) or any object."""
 
@@ -118,24 +270,41 @@ class MiniFlow:
     begin_state: a State instance (explicit flow) or a State subclass (command flow,
     offered at every state that is an instance of it).
     end_state: a State, a Branch, Return(), or None (None means the same as Return()).
+
+    Constructor: `Read("message", name=...)` (begin/end set later with `begin`/`begin_end` or as keywords),
+    or the old positional form `Read(begin, end, "message", "name")`. Without a name, the message is used.
     """
 
     def __init__(
         self,
-        begin_state: Union[State, type, None] = None,
-        end_state: Union[State, Branch, Return, None] = None,
-        message: str = "",
-        name: str = "",
+        *args: Any,
+        begin_state: Union[State, type, None] = _UNSET,
+        end_state: Union[State, Branch, Return, None] = _UNSET,
+        message: str = _UNSET,
+        name: Optional[str] = _UNSET,
     ):
-        self.name = name
-        self.begin_state = begin_state
-        self.end_state = end_state
+        self.message = self._setup(args, begin_state, end_state, name, "message", message, "")
+
+    def _setup(self, args, begin_state, end_state, name, content_key: str, content, default):
+        """Bind positional arguments (short or old form) and set the common attributes. Returns the content."""
+        given = _bind_args(
+            type(self).__name__,
+            content_key,
+            args,
+            {"begin_state": begin_state, "end_state": end_state, content_key: content, "name": name},
+        )
+        self.begin_state = None if given["begin_state"] is _UNSET else given["begin_state"]
+        self.end_state = None if given["end_state"] is _UNSET else given["end_state"]
+        content = default if given[content_key] is _UNSET else given[content_key]
+        message = content if content_key == "message" else ""
+        name = None if given["name"] is _UNSET else given["name"]
+        self.name = name or (message if isinstance(message, str) else "") or type(self).__name__
         self.message = message
-        self.is_complete = False
 
         # Data handling
         self._data_update_func: Optional[Union[Callable, str]] = None
         self._context_build_func: Optional[Union[Callable, str]] = None
+        return content
 
     def begin(self, state_or_type: Union[State, type]):
         self.begin_state = state_or_type
@@ -171,12 +340,17 @@ class MiniFlow:
         if not self._context_build_func:
             return self.message
 
-        if isinstance(self._context_build_func, str):
+        tmpl = self._context_build_func
+        if isinstance(tmpl, str):
+            if "{" not in tmpl and "}" not in tmpl:
+                # A bare name of an attribute/key of data gives that value; any other text is literal.
+                found, value = _lookup(data, tmpl) if data is not None else (False, None)
+                return value if found else tmpl
             if data is not None:
                 try:
-                    return self._context_build_func.format_map(_Fields(data))
+                    return tmpl.format_map(_Fields(data))
                 except (KeyError, AttributeError):
-                    return getattr(data, self._context_build_func, self.message)
+                    pass
             return self.message
 
         return _call_with_data(self._context_build_func, data)
@@ -186,7 +360,9 @@ class MiniFlow:
             return
 
         if isinstance(self._data_update_func, str):
-            if data is not None:
+            if isinstance(data, MutableMapping):
+                data[self._data_update_func] = value
+            elif data is not None:
                 setattr(data, self._data_update_func, value)
             return
 
@@ -195,9 +371,6 @@ class MiniFlow:
             self._data_update_func(value)
         else:
             self._data_update_func(data, value)
-
-    def complete(self):
-        self.is_complete = True
 
 
 class ApplicationRunnerBase(abc.ABC):
@@ -357,7 +530,6 @@ class ApplicationRunnerBase(abc.ABC):
         return problems
 
     def render(self, flow: MiniFlow):
-        flow.is_complete = False
         if isinstance(flow, Read):
             self.show_read(flow)
         elif isinstance(flow, Write):
@@ -374,7 +546,6 @@ class ApplicationRunnerBase(abc.ABC):
     def show_linear_combine(self, flow: "LinearCombine"):
         for child in flow.flows:
             self.render(child)
-        flow.complete()
 
     @abc.abstractmethod
     def show_read(self, flow: "Read"):
@@ -412,26 +583,65 @@ def _describe_end(end) -> str:
 
 
 class Read(MiniFlow):
-    """The user reads: the app displays information."""
+    """The user reads: the app displays information. `Read("text", name=...)`."""
 
 
 class Write(MiniFlow):
-    """The user writes: the app takes input."""
+    """The user writes: the app takes input. `Write("prompt", name=..., kind=Number(min=0), validate=...)`.
+
+    kind: what kind of value is wanted (Text() by default, Password(), Number(...), YesNo()); the runner
+    picks the widget and `data_update` receives the converted value (str, int/float, bool).
+    validate: optional `validate(value)` or `validate(data, value)` returning an error message or None.
+    Runners ask again (showing the message) until the value is accepted.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        begin_state: Union[State, type, None] = _UNSET,
+        end_state: Union[State, Branch, Return, None] = _UNSET,
+        message: str = _UNSET,
+        name: Optional[str] = _UNSET,
+        kind: Union[Kind, type, None] = None,
+        validate: Optional[Callable[..., Optional[str]]] = None,
+    ):
+        super().__init__(*args, begin_state=begin_state, end_state=end_state, message=message, name=name)
+        self.kind = _as_kind(kind)
+        self.validator = validate
+
+    def accept(self, raw: Any, data: Any = None) -> Any:
+        """Convert and validate what the user entered. Returns the value or raises InvalidInput(message)."""
+        try:
+            value = self.kind.convert(raw)
+        except ValueError as e:
+            raise InvalidInput(str(e)) from None
+        error = self.kind.check(value)
+        if error is None and self.validator is not None:
+            if len(inspect.signature(self.validator).parameters) >= 2:
+                error = self.validator(data, value)
+            else:
+                error = self.validator(value)
+        if error:
+            raise InvalidInput(str(error))
+        return value
 
 
 class Choice(MiniFlow):
-    def __init__(self, begin_state=None, end_state=None, choices=(), name=""):
-        super().__init__(begin_state, end_state, "", name)
-        self.choices = choices
+    """The user picks one of `choices`. `Choice(["a", "b"], name=...)`; old form `Choice(begin, end, choices, name)`."""
+
+    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, choices=_UNSET, name=_UNSET):
+        self.choices = self._setup(args, begin_state, end_state, name, "choices", choices, ())
 
 
 class Combine(MiniFlow):
-    def __init__(self, begin_state=None, end_state=None, flows=(), name=""):
-        super().__init__(begin_state, end_state, "", name)
-        self.flows = flows
+    """Child steps shown together (one screen in a GUI). `Combine([...], name=...)`. Children may be any step."""
+
+    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET):
+        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, ())
 
 
 class LinearCombine(MiniFlow):
-    def __init__(self, begin_state=None, end_state=None, flows=(), name=""):
-        super().__init__(begin_state, end_state, "", name)
-        self.flows = flows
+    """Child steps run one after another. `LinearCombine([...], name=...)`. Children may be any step."""
+
+    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET):
+        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, ())
