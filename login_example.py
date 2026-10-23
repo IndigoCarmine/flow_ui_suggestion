@@ -1,8 +1,7 @@
-import sys
 from dataclasses import dataclass
 
 import base
-import cui
+import runtime
 
 USERS = {"alice": "secret"}
 
@@ -58,14 +57,8 @@ def build_app(runner: base.ApplicationRunnerBase) -> base.ApplicationRunnerBase:
 
 
 def main() -> None:
-    data = LoginData()
-    if "gui" in sys.argv[1:]:
-        import gui
-
-        runner = gui.GuiRunner(data)
-    else:
-        runner = cui.CuiRunner(data)
-    build_app(runner).run()
+    # バックエンドは --cui/--gui、環境変数 FLOW_UI_BACKEND、または自動判定で決まる
+    runtime.run(build_app, LoginData())
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import base
-import cui
+import runtime
 
 
 @dataclass(slots=True)
@@ -38,7 +38,10 @@ def build_app(runner: base.ApplicationRunnerBase) -> base.ApplicationRunnerBase:
 
     flows: list[base.MiniFlow] = [
         base.LinearCombine(start, middle, build_registration_steps(), "RegistrationProcess"),
-        base.Read(middle, end, "Process Complete", "EndMessage"),
+        # テンプレート文字列はslots=Trueのdataclassでも使える
+        base.Read(middle, end, "Process Complete", "EndMessage").context_build(
+            "Registered: {name}, age {age_text}"
+        ),
     ]
 
     for flow in flows:
@@ -47,14 +50,8 @@ def build_app(runner: base.ApplicationRunnerBase) -> base.ApplicationRunnerBase:
 
 
 def main() -> None:
-    data = UserData()
-    # GUIを使う場合はこちら（PySide6はGUI選択時のみ読み込む）
-    import gui
-
-    runner = gui.GuiRunner(data)
-    # CUIを使う場合はこちら
-    # runner = cui.CuiRunner(data)
-    build_app(runner).run()
+    # バックエンドは --cui/--gui、環境変数 FLOW_UI_BACKEND、または自動判定で決まる
+    runtime.run(build_app, UserData())
 
 
 if __name__ == "__main__":

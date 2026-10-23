@@ -1,22 +1,64 @@
 import abc
 import inspect
+import sys
+from collections.abc import Mapping
 from typing import Any, Callable, Optional, Union
 
 
 class State:
-    def __init__(self, name: str = None):
+    """A node of the flow graph.
+
+    Named states compare by (class, name): two `State("home")` are the same node.
+    An unnamed `State()` is only equal to itself.
+    """
+
+    def __init__(self, name: Optional[str] = None):
         self.name = name
+
+    def _key(self):
+        return None if self.name is None else (type(self), self.name)
+
+    def __eq__(self, other):
+        if not isinstance(other, State):
+            return NotImplemented
+        key = self._key()
+        if key is None:
+            return self is other
+        return key == other._key()
+
+    def __hash__(self):
+        key = self._key()
+        return object.__hash__(self) if key is None else hash(key)
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.name if self.name else ''})"
 
 
-class Start(State):
-    pass
+class _UniqueState(State):
+    """A state with exactly one instance per class. The name is cosmetic (the last one given is kept)."""
+
+    def __new__(cls, name: Optional[str] = None):
+        instance = cls.__dict__.get("_instance")
+        if instance is None:
+            instance = super().__new__(cls)
+            instance.name = None
+            cls._instance = instance
+        return instance
+
+    def __init__(self, name: Optional[str] = None):
+        if name is not None:
+            self.name = name
+
+    def _key(self):
+        return (type(self),)
 
 
-class End(State):
-    pass
+class Start(_UniqueState):
+    """The start of the app. `Start()` and `Start("name")` are always the same object."""
+
+
+class End(_UniqueState):
+    """The end of the app. `End()` and `End("name")` are always the same object."""
 
 
 class Return:
@@ -42,7 +84,7 @@ class Branch:
 
     def resolve(self, data: Any):
         result = _call_with_data(self.check, data)
-        if not any(result is c for c in self.candidates):
+        if not any(result == c for c in self.candidates):
             raise ValueError(
                 f"Branch check returned {result!r}, which is not one of its candidates {self.candidates!r}"
             )
@@ -53,6 +95,21 @@ def _call_with_data(func: Callable, data: Any):
     if len(inspect.signature(func).parameters) == 0:
         return func()
     return func(data)
+
+
+class _Fields:
+    """Lets `str.format_map` read fields from a dict, a dataclass (also with slots=True) or any object."""
+
+    def __init__(self, data: Any):
+        self.data = data
+
+    def __getitem__(self, key: str):
+        if isinstance(self.data, Mapping):
+            return self.data[key]
+        try:
+            return getattr(self.data, key)
+        except AttributeError:
+            raise KeyError(key) from None
 
 
 class MiniFlow:
@@ -117,8 +174,7 @@ class MiniFlow:
         if isinstance(self._context_build_func, str):
             if data is not None:
                 try:
-                    d_dict = data.__dict__ if hasattr(data, "__dict__") else data
-                    return self._context_build_func.format(**d_dict)
+                    return self._context_build_func.format_map(_Fields(data))
                 except (KeyError, AttributeError):
                     return getattr(data, self._context_build_func, self.message)
             return self.message
@@ -157,6 +213,10 @@ class ApplicationRunnerBase(abc.ABC):
             self.start_state = flow.begin_state
 
     def run(self):
+        problems = self.validate()
+        if problems:
+            self.warn(problems)
+
         if not self.start_state:
             for f in self.flows:
                 if isinstance(f.begin_state, Start):
@@ -183,7 +243,7 @@ class ApplicationRunnerBase(abc.ABC):
 
     def flows_for(self, state: State) -> tuple[list[MiniFlow], list[MiniFlow]]:
         """Explicit flows that begin at this state, and command flows whose type matches it."""
-        flows = [f for f in self.flows if not f.is_command and f.begin_state is state]
+        flows = [f for f in self.flows if not f.is_command and f.begin_state == state]
         commands = []
         if not isinstance(state, End):
             commands = [
@@ -197,6 +257,104 @@ class ApplicationRunnerBase(abc.ABC):
         if end is None or end is Return():
             return origin
         return end
+
+    def warn(self, problems: list[str]):
+        """Report problems found by `validate()`. Backends may override this."""
+        for problem in problems:
+            print(f"WARNING: {problem}", file=sys.stderr)
+
+    # --- static graph check -------------------------------------------------
+
+    def states(self) -> list[State]:
+        """Every State mentioned by a flow (begin, end or Branch candidate), in order of appearance."""
+        found: dict[State, None] = {}
+        for f in self.flows:
+            if isinstance(f.begin_state, State):
+                found.setdefault(f.begin_state)
+            for target in _end_targets(f.end_state):
+                if isinstance(target, State):
+                    found.setdefault(target)
+        return list(found)
+
+    def successors(self, state: State) -> list[State]:
+        """States reachable from `state` in one flow (Return/None means `state` itself)."""
+        flows, commands = self.flows_for(state)
+        result: dict[State, None] = {}
+        for f in flows + commands:
+            for target in _end_targets(f.end_state):
+                if target is None or target is Return():
+                    result.setdefault(state)
+                elif isinstance(target, State):
+                    result.setdefault(target)
+        return list(result)
+
+    def describe(self) -> str:
+        """Text listing of the graph: states, explicit flows, Branch candidates and commands."""
+        lines = ["States:"]
+        for st in self.states():
+            flows, commands = self.flows_for(st)
+            extra = f"  commands: {', '.join(c.name for c in commands)}" if commands else ""
+            lines.append(f"  {st!r}{extra}")
+        lines.append("Flows:")
+        for f in self.flows:
+            if not f.is_command:
+                lines.append(f"  {f.name}: {f.begin_state!r} -> {_describe_end(f.end_state)}")
+        commands = [f for f in self.flows if f.is_command]
+        if commands:
+            lines.append("Commands:")
+            for c in commands:
+                lines.append(f"  {c.name}: any {c.begin_state.__name__} -> {_describe_end(c.end_state)}")
+        return "\n".join(lines)
+
+    def validate(self) -> list[str]:
+        """Check the graph without running it. Returns a list of problems (empty if none found)."""
+        problems: list[str] = []
+        states = self.states()
+
+        starts = [f for f in self.flows if isinstance(f.begin_state, Start)]
+        if not starts:
+            problems.append("no flow begins at Start")
+
+        branch_targets: dict[State, str] = {}
+        for f in self.flows:
+            if not isinstance(f.end_state, Branch):
+                continue
+            if not f.end_state.candidates:
+                problems.append(f"Branch of flow '{f.name}' has no candidates")
+            for c in f.end_state.candidates:
+                if not isinstance(c, (State, Return)):
+                    problems.append(f"Branch of flow '{f.name}' has candidate {c!r}, which is not a State or Return()")
+                elif isinstance(c, State):
+                    branch_targets.setdefault(c, f.name)
+
+        for c in self.flows:
+            if c.is_command and not any(isinstance(st, c.begin_state) for st in states):
+                problems.append(f"command '{c.name}' begins at {c.begin_state.__name__}, but no state is of that type")
+
+        for st in states:
+            if isinstance(st, End):
+                continue
+            flows, commands = self.flows_for(st)
+            if flows or commands:
+                continue
+            if st in branch_targets:
+                problems.append(f"Branch candidate {st!r} of flow '{branch_targets[st]}' leads nowhere (no flow begins there)")
+            else:
+                problems.append(f"dead end: no flow begins at {st!r}")
+
+        if starts:
+            seen = {starts[0].begin_state}
+            todo = [starts[0].begin_state]
+            while todo:
+                for nxt in self.successors(todo.pop()):
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        todo.append(nxt)
+            for st in states:
+                if st not in seen:
+                    problems.append(f"unreachable from Start: {st!r}")
+
+        return problems
 
     def render(self, flow: MiniFlow):
         flow.is_complete = False
@@ -237,6 +395,20 @@ class ApplicationRunnerBase(abc.ABC):
     @abc.abstractmethod
     def select_flow(self, flows: list[MiniFlow], commands: list[MiniFlow]) -> MiniFlow:
         """Let the user pick one of the explicit flows or commands available at the current state."""
+
+
+def _end_targets(end) -> list:
+    if isinstance(end, Branch):
+        return list(end.candidates)
+    return [end]
+
+
+def _describe_end(end) -> str:
+    if end is None or end is Return():
+        return "Return (back to where it began)"
+    if isinstance(end, Branch):
+        return "Branch[" + ", ".join(repr(c) for c in end.candidates) + "]"
+    return repr(end)
 
 
 class Read(MiniFlow):

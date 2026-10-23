@@ -17,6 +17,7 @@ Flow UI Frameworkは、アプリケーションの振る舞いを「状態（Sta
 - **Start**: アプリケーションの開始点。
 - **End**: アプリケーションの終了点。
 - **Custom State**: ユーザー定義の状態。
+- **同一性**: 名前付きのStateは（型, 名前）で等価・ハッシュを決める（`State("home") == State("home")`、`LoggedIn("home") != State("home")`）。名前の無い `State()` は自分自身とだけ等しい。`Start` と `End` はそれぞれ1つだけのインスタンスで（`Start() is Start("x")`）、名前は表示用。`Return()` はStateではなく、どのStateとも等しくない。
 
 ### 3.2 MiniFlow（インターフェース/遷移）
 あるStateから別のStateへの遷移を定義し、その過程で発生するユーザーインタラクションを保持する。
@@ -30,7 +31,7 @@ Flow UI Frameworkは、アプリケーションの振る舞いを「状態（Sta
 - **終了の扱い**:
   - `end_state` を省略、または `Return()` の場合: フローを始めた状態（実行開始時の現在状態）へ戻る。戻るのは1段だけで、呼び出しスタックやコマンドの入れ子は持たない。
   - Stateを指定した場合: その状態へ進む（例: ログアウトは `begin_end(LoggedIn, start)`）。
-- **Branch（分岐）**: `Branch(check, candidates)`。`check(data)` がStateを返し、そこへ進む。分岐先は `candidates` として宣言するのでグラフを静的に列挙できる。返り値が候補のどれでもない場合（同一性で比較。`Return()` は候補に含めたときのみ可）は実行時エラーとする。
+- **Branch（分岐）**: `Branch(check, candidates)`。`check(data)` がStateを返し、そこへ進む。分岐先は `candidates` として宣言するのでグラフを静的に列挙できる。返り値が候補のどれでもない場合（Stateの等価性で比較。`Return()` は候補に含めたときのみ可）は実行時エラーとする。
 
 ## 4. プリミティブ・インタラクション
 MiniFlowの具体的な実装として、以下の基本インタラクションを定義する。
@@ -60,3 +61,16 @@ Runtimeは、定義されたグラフを解釈し、実際のプラットフォ�
 3. `MiniFlow` のインタラクション（表示・入力）が完了するまで待機する。
 4. インタラクション完了後、`end_state` から次の状態を決める（`Branch` なら `check` を評価し、`None`/`Return()` ならフローを始めた状態に戻る）。
 5. 現在の状態が `End` に達するまで 2-4 を繰り返す。
+
+## 7. 静的検査
+Runnerは実行前にグラフを検査できる。
+- `describe()`: 状態、明示的なフロー、Branchの候補、状態ごとに使えるコマンドを文字列で返す。
+- `validate()`: 問題の一覧（文字列のリスト）を返す。検出するもの: `Start` から始まるフローが無い／出口の無い状態（`End` 以外。その型に当てはまるコマンドも出口に数える）／`Start` から到達できない状態／行き先の無い、またはState・`Return()` 以外のBranch候補／どの状態の型にも当てはまらないコマンド。
+- `run()` は開始時に `validate()` を呼び、問題があれば `warn()`（既定では標準エラー出力）で警告して実行を続ける。
+
+## 8. Runtimeの選択
+- `runtime.run(build_app, data, backend=None)` / `runtime.make_runner(data, backend=None)`。
+- 優先順位: 引数 `backend` > コマンドライン `--cui` / `--gui` > 環境変数 `FLOW_UI_BACKEND` > 自動判定。
+- 自動判定: 画面があり（Linux等では `DISPLAY` か `WAYLAND_DISPLAY`、macOS/Windowsは常にあるとみなす）、PySide6が読み込めればGUI、そうでなければCUI。GUIモジュールは選ばれたときだけ読み込む。
+- アプリのコードは `base` と `runtime` だけを使い、Backendを直接importしない。
+- `scripted.ScriptedRunner(data, answers)` は画面を持たないBackendで、決められた答えで実行し、表示内容を `transcript` に記録する（テスト用）。答えが尽きると `ScriptExhausted`。
