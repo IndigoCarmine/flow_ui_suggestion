@@ -5,8 +5,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import base
 
-_INT_LIMIT = 2_147_483_647
-
 TWO_COLUMN_WIDTH = 720
 """A screen at least this wide shows its label/field rows in two columns."""
 
@@ -114,8 +112,14 @@ class GuiRunner(base.ApplicationRunnerBase):
     nested Combine/LinearCombine flattened) on one screen, as label/field rows that reflow into two
     columns when the window is wide. Input is converted and validated when Next is pressed (or Enter in the
     last field); if anything is rejected, the messages are shown under the fields and the screen stays.
-    In a cancellable flow a Cancel button (and Esc) cancels; elsewhere Esc only shows a hint in the status
-    bar. Closing the window ends `run()` (it returns base.QUIT)."""
+
+    Null (no value): an empty Text/Password/Number field when Next is pressed, the "(none)" entry of an
+    optional Choice, or Cancel/Esc for the whole screen. Each field follows its own effective policy, the
+    Cancel button the screen's: `?` exits the flow (data restored; the `.q()` message is shown at the top of
+    the next screen and in the status bar), `opt` stores None (fields say "optional"; the button reads
+    "Skip"), `!` shows "a value is required" under the field, and Esc only shows a hint in the status bar
+    (no button). Numbers are typed in a line edit (empty-able), not a spin box.
+    Closing the window ends `run()` (it returns base.QUIT)."""
 
     def __init__(self, data=None):
         super().__init__(data)
@@ -126,6 +130,8 @@ class GuiRunner(base.ApplicationRunnerBase):
         self.main_window.setCentralWidget(self.central_widget)
         self.layout = QtWidgets.QVBoxLayout(self.central_widget)
         self.form: Optional[ReflowForm] = None
+        self.notice: Optional[str] = None
+        """The notice waiting to be shown on the next screen (see show_notice)."""
         self._escape: Optional[Callable[[], None]] = None
         escape = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self.main_window)
         escape.activated.connect(self.press_escape)
@@ -137,7 +143,22 @@ class GuiRunner(base.ApplicationRunnerBase):
         if self._escape is not None:
             self._escape()
         elif self.active_flow is not None:
-            self.main_window.statusBar().showMessage(f"'{self.active_flow.name}' cannot be cancelled", 4000)
+            self.main_window.statusBar().showMessage(f"'{self.active_flow.name}' cannot be cancelled here", 4000)
+
+    def show_notice(self, text):
+        """Shown at the top of the next screen (and in the status bar for a while)."""
+        self.notice = text
+        self.main_window.statusBar().showMessage(text, 8000)
+
+    def _take_notice(self):
+        if self.notice is None:
+            return
+        label = QtWidgets.QLabel(self.notice)
+        label.setObjectName("notice")
+        label.setWordWrap(True)
+        label.setStyleSheet("background: #fff3cd; color: #5f4b00; padding: 6px; border-radius: 4px;")
+        self.layout.addWidget(label)
+        self.notice = None
 
     def show_read(self, flow):
         self._show_screen(flow)
@@ -153,37 +174,42 @@ class GuiRunner(base.ApplicationRunnerBase):
 
     # --- building one screen ---------------------------------------------------------------------
 
-    def _add_step(self, flow, form: ReflowForm, fields: list, parent_name: Optional[str] = None):
-        """Add the widgets of `flow` to the form. Every input step appends (flow, read_value, widget)."""
+    def _add_step(self, flow, form: ReflowForm, fields: list, policy: base.NullPolicy, parent_name: Optional[str] = None):
+        """Add the widgets of `flow` (whose effective policy is `policy`) to the form. Every input step
+        appends (flow, policy, read_raw, error_label, widget); read_raw gives None for "no value"."""
         if isinstance(flow, base.Read):
             label = QtWidgets.QLabel(str(flow.resolve_content(self.data)))
             label.setWordWrap(True)
             form.add_full(label)
         elif isinstance(flow, base.Write):
             prompt = str(flow.resolve_content(self.data))
-            widget, read_value = self._input_widget(flow)
-            self._add_row(form, prompt, widget, flow, read_value, fields)
+            widget, read_raw = self._input_widget(flow, policy)
+            self._add_row(form, prompt, widget, flow, policy, read_raw, fields)
         elif isinstance(flow, base.Choice):
             choices = list(flow.resolve_content(self.data) or flow.choices)
             combo = QtWidgets.QComboBox()
+            offset = 0
+            if policy.kind == "opt":
+                combo.addItem("(none)")
+                offset = 1
             combo.addItems([str(c) for c in choices])
 
-            def read_choice(choices=choices, combo=combo):
-                idx = combo.currentIndex()
+            def read_choice(choices=choices, combo=combo, offset=offset):
+                idx = combo.currentIndex() - offset
                 if not 0 <= idx < len(choices):
-                    raise base.InvalidInput("nothing to choose")
+                    return None
                 return choices[idx]
 
             label = "" if flow.name == type(flow).__name__ else flow.name
-            self._add_row(form, label, combo, flow, read_choice, fields)
+            self._add_row(form, label, combo, flow, policy, read_choice, fields)
         elif isinstance(flow, (base.Combine, base.LinearCombine)):
             for child in flow.flows:
-                self._add_step(child, form, fields, flow.name)
+                self._add_step(child, form, fields, self.policy_for(child, policy), flow.name)
         else:
             where = f" inside '{parent_name}'" if parent_name else ""
             raise TypeError(f"GuiRunner cannot show {type(flow).__name__} '{flow.name}'{where}")
 
-    def _add_row(self, form: ReflowForm, prompt: str, widget, flow, read_value, fields: list):
+    def _add_row(self, form: ReflowForm, prompt: str, widget, flow, policy, read_raw, fields: list):
         label = QtWidgets.QLabel(prompt)
         label.setWordWrap(True)
         label.setBuddy(widget)
@@ -194,34 +220,36 @@ class GuiRunner(base.ApplicationRunnerBase):
         error = self._error_label()
         cell_layout.addWidget(error)
         form.add_row(label, cell)
-        fields.append((flow, read_value, error, widget))
+        fields.append((flow, policy, read_raw, error, widget))
 
-    def _input_widget(self, flow: base.Write) -> tuple[QtWidgets.QWidget, Callable[[], Any]]:
-        """A widget that fits flow.kind and a function giving the accepted value."""
+    def _input_widget(self, flow: base.Write, policy: base.NullPolicy) -> tuple[QtWidgets.QWidget, Callable[[], Any]]:
+        """A widget that fits flow.kind and a function giving what was entered (checked on Next)."""
         kind = flow.kind
         if isinstance(kind, base.YesNo):
             box = QtWidgets.QCheckBox()
-            return box, lambda: flow.accept(box.isChecked(), self.data)
-
-        if isinstance(kind, base.Number):
-            spin = QtWidgets.QSpinBox() if kind.decimals == 0 else QtWidgets.QDoubleSpinBox()
-            if isinstance(spin, QtWidgets.QDoubleSpinBox):
-                spin.setDecimals(kind.decimals)
-            low = -_INT_LIMIT if kind.min is None else kind.min
-            high = _INT_LIMIT if kind.max is None else kind.max
-            spin.setRange(int(low) if kind.decimals == 0 else low, int(high) if kind.decimals == 0 else high)
-            spin.setValue(min(max(0, spin.minimum()), spin.maximum()))
-
-            def read_number():
-                spin.interpretText()
-                return flow.accept(spin.value(), self.data)
-
-            return spin, read_number
+            return box, box.isChecked
 
         line_edit = QtWidgets.QLineEdit()
+        hints = []
+        if isinstance(kind, base.Number):
+            # A line edit (not a spin box) so that "no number" can be entered: empty is null.
+            digits = r"\d*" if kind.decimals == 0 else r"\d*(\.\d{0,%d})?" % kind.decimals
+            sign = "-?" if kind.min is None or kind.min < 0 else ""
+            pattern = QtCore.QRegularExpression(f"{sign}{digits}")
+            line_edit.setValidator(QtGui.QRegularExpressionValidator(pattern, line_edit))
+            if kind.min is not None and kind.max is not None:
+                hints.append(f"{kind.min}-{kind.max}")
+            elif kind.min is not None:
+                hints.append(f">= {kind.min}")
+            elif kind.max is not None:
+                hints.append(f"<= {kind.max}")
         if isinstance(kind, base.Password):
             line_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        return line_edit, lambda: flow.accept(line_edit.text(), self.data)
+        if policy.kind == "opt":
+            hints.append("optional")
+        if hints:
+            line_edit.setPlaceholderText(", ".join(hints))
+        return line_edit, line_edit.text
 
     def _error_label(self) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel()
@@ -240,17 +268,30 @@ class GuiRunner(base.ApplicationRunnerBase):
 
     def _show_screen(self, flow):
         self._clear()
+        self._take_notice()
+        screen_policy = self.current_policy
         form = ReflowForm()
         fields: list = []
-        self._add_step(flow, form, fields)
-        outcome: list[Optional[str]] = [None]
+        self._add_step(flow, form, fields, screen_policy)
+        outcome: list[Any] = [None]
 
         def on_next():
             values = []
-            for step, read_value, error_label, _ in fields:
+            for step, policy, read_raw, error_label, _ in fields:
+                raw = read_raw()
+                error_label.hide()
+                if step.is_empty(raw):
+                    if policy.kind == "opt":
+                        values.append((step, None))
+                    elif policy.kind == "q":
+                        outcome[0] = ("exit", policy, step.name)  # `?`: leave the flow, nothing is stored
+                        return
+                    else:
+                        error_label.setText(base.EMPTY_MESSAGE)
+                        error_label.show()
+                    continue
                 try:
-                    values.append((step, read_value()))
-                    error_label.hide()
+                    values.append((step, step.accept(raw, self.data)))
                 except base.InvalidInput as e:
                     error_label.setText(str(e))
                     error_label.show()
@@ -260,36 +301,44 @@ class GuiRunner(base.ApplicationRunnerBase):
                 outcome[0] = "next"
 
         def on_cancel():
-            outcome[0] = "cancel"
+            outcome[0] = ("exit", screen_policy, flow.name) if screen_policy.kind == "q" else "skip"
 
+        if screen_policy.kind != "must":
+            self._escape = on_cancel
         self.layout.addWidget(form)
         self.layout.addStretch(1)
         button_row = QtWidgets.QWidget()
         buttons = QtWidgets.QHBoxLayout(button_row)
         buttons.setContentsMargins(0, 0, 0, 0)
         buttons.addStretch(1)
-        if self.can_cancel:
-            cancel_button = QtWidgets.QPushButton("Cancel")
-            cancel_button.setToolTip("Leave this without finishing it (Esc)")
+        if screen_policy.kind != "must":
+            skip = screen_policy.kind == "opt"
+            cancel_button = QtWidgets.QPushButton("Skip" if skip else "Cancel")
+            cancel_button.setToolTip(
+                "Continue without giving these values (Esc)" if skip else "Leave this without finishing it (Esc)"
+            )
             cancel_button.clicked.connect(on_cancel)
             buttons.addWidget(cancel_button)
-            self._escape = on_cancel
         next_button = QtWidgets.QPushButton("Next")
         next_button.clicked.connect(on_next)
         buttons.addWidget(next_button)
         self.layout.addWidget(button_row)
 
         enter = _EnterKeys(form, on_next)
-        for _, _, _, widget in fields:
+        for *_, widget in fields:
             enter.watch(widget)
         enter.watch(next_button)
         form.reflow(max(self.central_widget.width(), 1))
         self.form = form
-        (fields[0][3] if fields else next_button).setFocus()
+        (fields[0][-1] if fields else next_button).setFocus()
 
         self._wait(lambda: outcome[0] is not None)
-        if outcome[0] == "cancel":
-            raise base.Cancelled()
+        if outcome[0] == "skip":  # `opt` screen: every field gives None
+            for step, *_ in fields:
+                step.apply_update(self.data, None)
+        elif isinstance(outcome[0], tuple):
+            _, policy, step_name = outcome[0]
+            self.null_given(step_name, policy)  # raises base.Cancelled for `?`
 
     def _wait(self, finished: Callable[[], bool]):
         """Run the Qt event loop until `finished()` is true. Progress lives here, not on the step.
@@ -309,6 +358,7 @@ class GuiRunner(base.ApplicationRunnerBase):
             selected[0] = f
 
         self._clear()
+        self._take_notice()
         self.layout.addWidget(QtWidgets.QLabel(str(self.current_state)))
         for f in flows:
             btn = QtWidgets.QPushButton(f.name)

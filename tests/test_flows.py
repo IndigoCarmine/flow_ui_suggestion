@@ -53,6 +53,7 @@ class LoginExampleTest(unittest.TestCase):
         runner.run()
         self.assertEqual(runner.remaining_answers, [])
         self.assertEqual(data.display_name, "Bob")
+        self.assertIn(("notice", "login", "パスワードが違います"), runner.transcript)
         self.assertEqual(
             reads(runner),
             [
@@ -80,7 +81,7 @@ class LoginExampleTest(unittest.TestCase):
 
     def test_describe(self):
         text = login_example.build_app(ScriptedRunner(login_example.LoginData())).describe()
-        self.assertIn("login: Start() -> Branch[LoggedIn(home), Return()]", text)
+        self.assertIn("login: Start() -> Branch[LoggedIn(home)] (None: ? 'パスワードが違います')  [!]", text)
         self.assertIn("LoggedIn(home)  commands: profile, edit-name, logout, quit", text)
 
 
@@ -380,12 +381,19 @@ class ValidationTest(unittest.TestCase):
             run_writes([step], ["11"], data)
         self.assertEqual(data, {})
 
-    def test_login_blank_name(self):
-        answers = ["alice", "secret", "edit-name", "   "]
+    def test_login_long_name(self):
+        answers = ["alice", "secret", "edit-name", "x" * 21]
         runner = login_example.build_app(ScriptedRunner(login_example.LoginData(), answers))
         with self.assertRaises(base.InvalidInput) as ctx:
             runner.run()
-        self.assertIn("name must not be blank", str(ctx.exception))
+        self.assertIn("name must be at most 20 characters", str(ctx.exception))
+
+    def test_login_blank_name_leaves_the_command(self):
+        answers = ["alice", "secret", "edit-name", "   ", "quit"]
+        runner = login_example.build_app(ScriptedRunner(login_example.LoginData(), answers))
+        self.assertIs(runner.run(), base.End())
+        self.assertEqual(runner.data.display_name, "(not set)")
+        self.assertIn(("notice", "edit-name", "名前は変更していません"), runner.transcript)
 
 
 class CombineTest(unittest.TestCase):
@@ -440,7 +448,7 @@ class CuiTest(unittest.TestCase):
         self.assertIn("  ! a value is required", out)
         self.assertIn("  ! enter a whole number", out)
         self.assertIn("  ! enter a number from 0 to 150", out)
-        self.assertEqual(prompts.count("Enter your age (0-150): "), 3)
+        self.assertEqual(prompts.count("Enter your age (0-150) (optional): "), 3)
 
     def test_password_uses_input_when_stdin_is_not_a_tty(self):
         data = login_example.LoginData()

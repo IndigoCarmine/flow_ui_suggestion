@@ -7,16 +7,19 @@ from typing import Optional
 import base
 
 CANCEL_TEXT = ":q"
-"""Typed alone at any prompt of a cancellable flow, cancels it."""
+"""Typed alone at a prompt inside a flow: the user gives no value (cancel)."""
 
 
 class CuiRunner(base.ApplicationRunnerBase):
     """Terminal backend.
 
-    Cancel: inside a cancellable flow, typing `:q` or EOF (Ctrl-D) cancels it; elsewhere `:q` only prints a
-    hint. Quit: Ctrl-C anywhere, or EOF at the selection prompt or in a flow that cannot be cancelled, ends
-    `run()` with a short message (it returns base.QUIT). A second EOF in a row also quits, so piped input that
-    has run out cannot loop. Read text is wrapped to the terminal width; Combine fields are numbered.
+    Null (no value): inside a flow, `:q` or EOF (Ctrl-D) at any prompt, or an empty answer to a Write or
+    Choice. It follows the step's null policy: `?` exits the flow (data restored, the `.q()` message is
+    printed), `opt` stores None (the prompt says "(optional)"), `!` asks again ("a value is required") or
+    says that cancelling is not possible here. Quit: Ctrl-C anywhere, or EOF at the selection prompt or at a
+    `!` step, ends `run()` with a short message (it returns base.QUIT). A second EOF in a row also quits, so
+    piped input that has run out cannot loop. Read text is wrapped to the terminal width; Combine fields
+    are numbered.
     """
 
     def __init__(self, data=None):
@@ -42,43 +45,56 @@ class CuiRunner(base.ApplicationRunnerBase):
         if not self._inline(flow, [0]):
             self._pause()
 
+    def show_notice(self, text):
+        print(f"\n[!] {text}")
+
+    def exited(self, flow, step):
+        if step != "Branch":
+            print(f"(cancelled '{flow.name}')")
+
     def _pause(self):
-        while self._read("[Press Enter to continue]") is None:
-            pass
+        while True:
+            text = self._read("[Press Enter to continue]")
+            if text is None:
+                continue
+            if text is base.CANCEL and not self._refuse(base.CANCEL):
+                continue
+            return
 
     def _inline(self, flow, counter: list) -> bool:
         """Show the children of a Combine one below the other, numbering the input fields.
         Returns whether any input was taken."""
         asked = False
         for child in flow.flows:
-            if isinstance(child, base.Read):
-                self._print(child)
-            elif isinstance(child, (base.Write, base.Choice)):
-                counter[0] += 1
-                label = f"[{counter[0]}] "
-                if isinstance(child, base.Write):
-                    self._ask(child, label)
+            with self.entering(child):
+                if isinstance(child, base.Read):
+                    self._print(child)
+                elif isinstance(child, (base.Write, base.Choice)):
+                    counter[0] += 1
+                    label = f"[{counter[0]}] "
+                    if isinstance(child, base.Write):
+                        self._ask(child, label)
+                    else:
+                        self._choose(child, label)
+                    asked = True
+                elif isinstance(child, (base.Combine, base.LinearCombine)):
+                    asked = self._inline(child, counter) or asked
                 else:
-                    self._choose(child, label)
-                asked = True
-            elif isinstance(child, (base.Combine, base.LinearCombine)):
-                asked = self._inline(child, counter) or asked
-            else:
-                raise TypeError(f"CuiRunner cannot show {type(child).__name__} '{child.name}' inside Combine '{flow.name}'")
+                    raise TypeError(f"CuiRunner cannot show {type(child).__name__} '{child.name}' inside Combine '{flow.name}'")
         return asked
 
     def _print(self, flow: base.Read):
         print(wrap(str(flow.resolve_content(self.data))))
 
-    # --- reading a line: cancel / quit handling ---------------------------------------------------
+    # --- reading a line: null / quit handling -----------------------------------------------------
 
-    def _read(self, prompt: str, secret: bool = False) -> Optional[str]:
-        """One line from the user. None means "ask again" (a `:q` that could not cancel anything).
-
-        Raises base.Cancelled or base.UserQuit for the user actions described in the class docstring.
-        """
-        if self.can_cancel and not self._cancel_hint_shown:
-            print(f"  (type {CANCEL_TEXT} or press Ctrl-D to cancel '{self.active_flow.name}')")
+    def _read(self, prompt: str, secret: bool = False, asks_value: bool = False):
+        """One line from the user, `base.CANCEL` for `:q`/EOF inside a flow, or None ("ask again": a `:q`
+        outside any flow). Raises base.UserQuit for the quit actions described in the class docstring."""
+        policy = self.current_policy
+        if self.active_flow is not None and policy.kind == "q" and not self._cancel_hint_shown:
+            empty = ", leave it empty" if asks_value else ""
+            print(f"  (type {CANCEL_TEXT}{empty} or press Ctrl-D to cancel '{self.active_flow.name}')")
             self._cancel_hint_shown = True
         try:
             text = _read_secret(prompt) if secret else input(prompt)
@@ -87,29 +103,41 @@ class CuiRunner(base.ApplicationRunnerBase):
             raise base.UserQuit() from None
         except EOFError:
             print()
-            if self.can_cancel and not self._eof_seen:
+            if self.active_flow is not None and policy.kind != "must" and not self._eof_seen:
                 self._eof_seen = True
-                print(f"(cancelled '{self.active_flow.name}')")
-                raise base.Cancelled() from None
+                return base.CANCEL
             print("End of input; exiting.")
             raise base.UserQuit() from None
         self._eof_seen = False
         if text.strip() == CANCEL_TEXT:
-            if self.can_cancel:
-                print(f"(cancelled '{self.active_flow.name}')")
-                raise base.Cancelled()
             if self.active_flow is None:
                 print("  ! nothing to cancel here (Ctrl-D or Ctrl-C quits)")
-            else:
-                print(f"  ! '{self.active_flow.name}' cannot be cancelled")
-            return None
+                return None
+            return base.CANCEL
         return text
 
+    def _refuse(self, answer) -> bool:
+        """Apply the null policy to a null answer: raises for `?`, True for `opt` (store None), False for
+        `!` after telling the user why (the caller asks again)."""
+        if self.null_given():
+            return True
+        if answer is base.CANCEL:
+            print(f"  ! '{self.active_flow.name}' cannot be cancelled here")
+        else:
+            print(f"  ! {base.EMPTY_MESSAGE}")
+        return False
+
     def _ask(self, flow: base.Write, label: str = ""):
-        prompt = f"{label}{flow.resolve_content(self.data)}{_hint(flow.kind)}: "
+        optional = " (optional)" if self.current_policy.kind == "opt" else ""
+        prompt = f"{label}{flow.resolve_content(self.data)}{_hint(flow.kind)}{optional}: "
         while True:
-            raw = self._read(prompt, secret=isinstance(flow.kind, base.Password))
+            raw = self._read(prompt, secret=isinstance(flow.kind, base.Password), asks_value=True)
             if raw is None:
+                continue
+            if raw is base.CANCEL or flow.is_empty(raw):
+                if self._refuse(raw):
+                    flow.apply_update(self.data, None)
+                    return
                 continue
             try:
                 value = flow.accept(raw, self.data)
@@ -121,13 +149,19 @@ class CuiRunner(base.ApplicationRunnerBase):
 
     def _choose(self, flow: base.Choice, label: str = ""):
         choices = list(flow.resolve_content(self.data) or flow.choices)
+        optional = " (optional)" if self.current_policy.kind == "opt" else ""
         if label:
             print(f"{label}{flow.name}")
         for i, choice in enumerate(choices):
             print(f"{i}: {choice}")
         while True:
-            text = self._read("Select option: ")
+            text = self._read(f"Select option{optional}: ", asks_value=True)
             if text is None:
+                continue
+            if text is base.CANCEL or not text.strip():
+                if self._refuse(text):
+                    flow.apply_update(self.data, None)
+                    return
                 continue
             try:
                 idx = int(text)

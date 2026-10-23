@@ -1,7 +1,9 @@
 import abc
+import contextlib
+import copy
 import inspect
 import sys
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, MutableSequence
 from typing import Any, Callable, Optional, Union
 
 
@@ -107,20 +109,100 @@ class _Sentinel:
 
 
 CANCEL: Any = _Sentinel("CANCEL")
-"""ScriptedRunner answer meaning "the user cancels the running flow here"."""
+"""ScriptedRunner answer meaning "the user cancels here" (one way of giving no value, i.e. null)."""
+
+
+# --- null handling: what a step does when the user gives no value ---------------------------------
+
+
+class NullPolicy:
+    """What happens when a step yields null (the user cancelled, left an optional field empty, or a Branch
+    check returned None). Set on a step with `.q(message)` (Rust `?`), `.must()` (Kotlin `!!`) or `.opt()`.
+
+    kind: "q" (exit the running top-level flow; data goes back to how it was when the flow started),
+    "must" (null is refused: ask again / refuse cancel) or "opt" (store None and continue).
+    message: only for "q", a notice the runner shows after going back.
+    """
+
+    KINDS = ("q", "must", "opt")
+
+    def __init__(self, kind: str, message: Optional[str] = None):
+        if kind not in self.KINDS:
+            raise ValueError(f"null policy must be one of {self.KINDS!r}, not {kind!r}")
+        if message is not None and kind != "q":
+            raise ValueError("only .q() takes a message")
+        self.kind = kind
+        self.message = message
+
+    @property
+    def label(self) -> str:
+        """`?`, `? "message"`, `!` or `opt` (used by describe())."""
+        if self.kind == "q":
+            return "?" if self.message is None else f"? {self.message!r}"
+        return "!" if self.kind == "must" else "opt"
+
+    def __eq__(self, other):
+        return isinstance(other, NullPolicy) and (self.kind, self.message) == (other.kind, other.message)
+
+    def __hash__(self):
+        return hash((self.kind, self.message))
+
+    def __repr__(self):
+        if self.kind == "q":
+            return "NullPolicy('q')" if self.message is None else f"NullPolicy('q', {self.message!r})"
+        return f"NullPolicy({self.kind!r})"
+
+
+Q = NullPolicy("q")
+MUST = NullPolicy("must")
+OPT = NullPolicy("opt")
+
+
+class _NullMarks:
+    """Mixin for the fluent null-policy methods. `null_policy` is the step's own mark (None: inherit)."""
+
+    null_policy: Optional[NullPolicy] = None
+
+    def q(self, message: Optional[str] = None):
+        """`?`: if this step yields null, exit the running top-level flow and go back to where it began, as if
+        nothing happened (data is restored). `message` is shown to the user as a notice."""
+        self.null_policy = NullPolicy("q", message)
+        return self
+
+    def must(self):
+        """`!`: null is not allowed. An empty answer is asked again; cancel is refused with a hint."""
+        self.null_policy = MUST
+        return self
+
+    def opt(self):
+        """Null is accepted: `data_update` receives None and the flow continues."""
+        self.null_policy = OPT
+        return self
 
 
 class Cancelled(Exception):
-    """Raised by a runner while a cancellable flow runs: the user abandoned it. `run()` catches it and goes
-    back to the state the flow began at, without evaluating its end."""
+    """Internal: raised (by a runner, or by a Branch marked `.q()`) when a step with the `?` policy yields
+    null. `run()` catches it, restores the data snapshot taken when the flow began, goes back to the state
+    the flow began at (without evaluating its end), and shows `message` as a notice if it is set."""
+
+    def __init__(self, message: Optional[str] = None, step: Optional[str] = None):
+        super().__init__(message or "")
+        self.message = message
+        self.step = step
 
 
 class UserQuit(Exception):
     """Raised by a runner when the user quits the app. `run()` catches it and returns `QUIT`."""
 
 
-class Branch:
-    """End of a flow that splits: `check(data)` returns one of the declared `candidates`."""
+class Branch(_NullMarks):
+    """End of a flow that splits: `check(data)` returns one of the declared `candidates`.
+
+    `check` may return None (null). With `.q(message)` that exits the flow like a cancel (data restored,
+    back to where the flow began, `message` shown). With `.opt()` it means "go back to where the flow began"
+    and keeps the data. Without a mark (or with `.must()`) None is an error like any other non-candidate.
+    Branch marks are its own; they are not inherited from the flow.
+    """
 
     def __init__(self, check: Callable[..., Any], candidates: list[Any]):
         self.check = check
@@ -128,6 +210,10 @@ class Branch:
 
     def resolve(self, data: Any):
         result = _call_with_data(self.check, data)
+        if result is None and self.null_policy is not None and self.null_policy.kind != "must":
+            if self.null_policy.kind == "q":
+                raise Cancelled(self.null_policy.message, step="Branch")
+            return Return()
         if not any(result == c for c in self.candidates):
             raise ValueError(
                 f"Branch check returned {result!r}, which is not one of its candidates {self.candidates!r}"
@@ -161,13 +247,26 @@ class Kind:
     def check(self, value: Any) -> Optional[str]:
         return None
 
+    def is_empty(self, raw: Any) -> bool:
+        """Whether `raw` means "no value" (null): None, or text that is empty or only blanks."""
+        return _is_blank(raw)
+
     def __repr__(self):
         args = ", ".join(f"{k}={v!r}" for k, v in vars(self).items())
         return f"{self.__class__.__name__}({args})"
 
 
+def _is_blank(raw: Any) -> bool:
+    return raw is None or (isinstance(raw, str) and not raw.strip())
+
+
+EMPTY_MESSAGE = "a value is required"
+"""What runners show when a `.must()` step gets an empty answer."""
+
+
 class Text(Kind):
-    """Free text (the default). `required=True` rejects empty or blank input."""
+    """Free text (the default). Empty or blank input is null (see `.q()` / `.must()` / `.opt()` on the step).
+    `required=True` is a synonym for marking the Write `.must()`."""
 
     def __init__(self, required: bool = False):
         self.required = required
@@ -177,7 +276,7 @@ class Text(Kind):
 
     def check(self, value: str) -> Optional[str]:
         if self.required and not value.strip():
-            return "a value is required"
+            return EMPTY_MESSAGE
         return None
 
 
@@ -186,7 +285,8 @@ class Password(Text):
 
 
 class Number(Kind):
-    """A number between `min` and `max` (both optional). `decimals=0` (default) gives an int, otherwise a float."""
+    """A number between `min` and `max` (both optional). `decimals=0` (default) gives an int, otherwise a float.
+    Empty input is null (None with `.opt()`)."""
 
     def __init__(self, min: Optional[float] = None, max: Optional[float] = None, decimals: int = 0):
         self.min = min
@@ -224,7 +324,8 @@ class Number(Kind):
 
 
 class YesNo(Kind):
-    """A yes/no answer, converted to bool. Text answers: y/yes/true/1 and n/no/false/0 (any case)."""
+    """A yes/no answer, converted to bool. Text answers: y/yes/true/1 and n/no/false/0 (any case); an empty
+    text answer is null (a GUI check box always has a value)."""
 
     YES = ("y", "yes", "true", "1")
     NO = ("n", "no", "false", "0")
@@ -303,7 +404,7 @@ class _Fields:
             raise KeyError(key) from None
 
 
-class MiniFlow:
+class MiniFlow(_NullMarks):
     """Backend-independent step. It only holds data; the runner decides how to render it.
 
     begin_state: a State instance (explicit flow) or a State subclass (command flow,
@@ -312,8 +413,10 @@ class MiniFlow:
 
     Constructor: `Read("message", name=...)` (begin/end set later with `begin`/`begin_end` or as keywords),
     or the old positional form `Read(begin, end, "message", "name")`. Without a name, the message is used.
-    cancellable: whether the user may abandon the flow midway (default: True for command flows only).
     command: optional short name for a command flow (default: `name`).
+    Null handling: `.q(message)` / `.must()` / `.opt()` (see `NullPolicy`); unmarked steps inherit from the
+    nearest marked enclosing Combine/LinearCombine, and a top-level flow defaults to `?` for command flows
+    and `!` otherwise.
     """
 
     def __init__(
@@ -323,14 +426,11 @@ class MiniFlow:
         end_state: Union[State, Branch, Return, None] = _UNSET,
         message: str = _UNSET,
         name: Optional[str] = _UNSET,
-        cancellable: Optional[bool] = None,
         command: Optional[str] = None,
     ):
-        self.message = self._setup(args, begin_state, end_state, name, "message", message, "", cancellable, command)
+        self.message = self._setup(args, begin_state, end_state, name, "message", message, "", command)
 
-    def _setup(
-        self, args, begin_state, end_state, name, content_key: str, content, default, cancellable=None, command=None
-    ):
+    def _setup(self, args, begin_state, end_state, name, content_key: str, content, default, command=None):
         """Bind positional arguments (short or old form) and set the common attributes. Returns the content."""
         given = _bind_args(
             type(self).__name__,
@@ -345,7 +445,7 @@ class MiniFlow:
         name = None if given["name"] is _UNSET else given["name"]
         self.name = name or (message if isinstance(message, str) else "") or type(self).__name__
         self.message = message
-        self.cancellable = cancellable
+        self.null_policy: Optional[NullPolicy] = None
         if command is not None and (not isinstance(command, str) or not command.strip() or " " in command.strip()):
             raise TypeError(f"command must be a short name without spaces, not {command!r}")
         self._command = None if command is None else command.strip()
@@ -372,17 +472,13 @@ class MiniFlow:
     def is_command(self) -> bool:
         return isinstance(self.begin_state, type)
 
-    @property
-    def cancellable(self) -> bool:
-        """Whether the user may abandon this flow midway. Default: True for command flows, False otherwise.
-        Set with `cancellable=` in the constructor (or assign the attribute); None restores the default."""
-        if self._cancellable is None:
-            return self.is_command
-        return self._cancellable
+    def own_policy(self) -> Optional[NullPolicy]:
+        """The null policy written on this step itself (None: inherit). `Text(required=True)` counts as `.must()`."""
+        return self.null_policy
 
-    @cancellable.setter
-    def cancellable(self, value: Optional[bool]):
-        self._cancellable = None if value is None else bool(value)
+    def is_empty(self, raw: Any) -> bool:
+        """Whether an answer means "no value" (null). Default: None or blank text."""
+        return _is_blank(raw)
 
     @property
     def command(self) -> str:
@@ -447,6 +543,7 @@ class ApplicationRunnerBase(abc.ABC):
         self.data = data
         self.active_flow: Optional[MiniFlow] = None
         self.result: Any = None
+        self._policies: list[NullPolicy] = []
 
     def add_miniflow(self, flow: MiniFlow):
         self.flows.append(flow)
@@ -465,15 +562,74 @@ class ApplicationRunnerBase(abc.ABC):
             self.result = self.current_state
         finally:
             self.active_flow = None
+            self._policies = []
         return self.result
 
-    @property
-    def can_cancel(self) -> bool:
-        """Whether the flow that is running now (the one chosen at the current state) may be cancelled."""
-        return self.active_flow is not None and self.active_flow.cancellable
+    # --- null policies ------------------------------------------------------------------------------
 
-    def cancelled(self, flow: "MiniFlow"):
-        """Called after the user cancelled `flow` (the state is back at where it began). Backends may override."""
+    @staticmethod
+    def default_policy(flow: "MiniFlow") -> NullPolicy:
+        """What an unmarked top-level flow does on null: `?` for command flows, `!` for the others."""
+        return Q if flow.is_command else MUST
+
+    def policy_for(self, step: "MiniFlow", inherited: Optional[NullPolicy] = None) -> NullPolicy:
+        """The effective policy of `step`: its own mark, else `inherited` (the enclosing step's effective
+        policy), else the top-level default of the running flow (or of `step` itself)."""
+        own = step.own_policy()
+        if own is not None:
+            return own
+        if inherited is not None:
+            return inherited
+        return self.default_policy(self.active_flow or step)
+
+    @property
+    def current_policy(self) -> NullPolicy:
+        """The effective policy of the step being shown now (MUST when no flow is running)."""
+        if self._policies:
+            return self._policies[-1]
+        return self.default_policy(self.active_flow) if self.active_flow is not None else MUST
+
+    @contextlib.contextmanager
+    def entering(self, step: "MiniFlow"):
+        """Make `step`'s effective policy the current one while it is shown. `render()` does this for every
+        step; backends that show children themselves (a Combine on one screen) use it per child."""
+        self._policies.append(self.policy_for(step, self._policies[-1] if self._policies else None))
+        try:
+            yield self._policies[-1]
+        finally:
+            self._policies.pop()
+
+    def null_given(self, step: Optional[str] = None, policy: Optional[NullPolicy] = None) -> bool:
+        """A step yielded null (cancel or empty answer). Applies `policy` (default: the current one):
+        `?` raises Cancelled (the flow exits), `opt` returns True (store None and go on), `!` returns False
+        (the backend refuses: ask again, or say that cancelling is not possible here)."""
+        policy = policy or self.current_policy
+        if policy.kind == "q":
+            raise Cancelled(policy.message, step=step)
+        return policy.kind == "opt"
+
+    def exited(self, flow: "MiniFlow", step: Optional[str]):
+        """Called after `flow` exited through `?` (data restored, state back where it began), before the
+        notice is shown. `step` names where the null came from ("Branch" for a Branch). Backends may override."""
+
+    @abc.abstractmethod
+    def show_notice(self, text: str):
+        """Show a short message to the user (the message of a `.q(message)` exit)."""
+
+    # --- data snapshot --------------------------------------------------------------------------------
+
+    def snapshot(self) -> Any:
+        """A deep copy of `data`, taken when a flow starts (None if it cannot be copied)."""
+        try:
+            return copy.deepcopy(self.data)
+        except Exception as e:  # e.g. data holding a lock or an open file
+            self.warn([f"data could not be copied ({e}); a flow that exits with ? cannot restore it"])
+            return None
+
+    def restore(self, snapshot: Any):
+        """Put `data` back to `snapshot` in place, so the app's data object stays the same object."""
+        if snapshot is not None:
+            restore_in_place(self.data, snapshot)
 
     def _loop(self):
         problems = self.validate()
@@ -501,17 +657,23 @@ class ApplicationRunnerBase(abc.ABC):
                 selected_flow = self.select_flow(flows, commands)
 
             origin = self.current_state
+            before = self.snapshot()
             self.active_flow = selected_flow
             try:
                 self.render(selected_flow)
-            except Cancelled:
-                # Updates of steps that already finished stay; the end (Branch etc.) is not evaluated.
+                following = self.resolve_end(selected_flow.end_state, origin)
+            except Cancelled as exit_:
+                # `?`: nothing happened. Data goes back to how it was when the flow began.
+                self.restore(before)
                 self.current_state = origin
-                self.cancelled(selected_flow)
+                self.exited(selected_flow, exit_.step)
+                if exit_.message:
+                    self.show_notice(exit_.message)
                 continue
             finally:
                 self.active_flow = None
-            self.current_state = self.resolve_end(selected_flow.end_state, origin)
+                self._policies = []
+            self.current_state = following
 
     def flows_for(self, state: State) -> tuple[list[MiniFlow], list[MiniFlow]]:
         """Explicit flows that begin at this state, and command flows whose type matches it."""
@@ -563,8 +725,9 @@ class ApplicationRunnerBase(abc.ABC):
     def describe(self) -> str:
         """Text listing of the graph: states, explicit flows, Branch candidates and commands.
 
-        Commands with a `command` alias are shown as `alias (name)`. A flow the user may cancel is marked
-        `[cancellable]`. Under each flow, every Write it contains is listed with its kind.
+        Commands with a `command` alias are shown as `alias (name)`. Every flow shows its effective null
+        policy (`[?]`, `[? 'message']`, `[!]` or `[opt]`), a Branch marked `.q()`/`.opt()` shows what None
+        does, and under each flow its steps are listed (Writes with their kind) with their effective policy.
         """
         lines = ["States:"]
         for st in self.states():
@@ -574,17 +737,40 @@ class ApplicationRunnerBase(abc.ABC):
         lines.append("Flows:")
         for f in self.flows:
             if not f.is_command:
-                lines.append(f"  {f.name}: {f.begin_state!r} -> {_describe_end(f.end_state)}{_flags(f)}")
-                lines.extend(_describe_writes(f))
+                lines.append(f"  {f.name}: {f.begin_state!r} -> {_describe_end(f.end_state)}{self._flags(f)}")
+                lines.extend(self._describe_steps(f))
         commands = [f for f in self.flows if f.is_command]
         if commands:
             lines.append("Commands:")
             for c in commands:
                 lines.append(
-                    f"  {_command_label(c)}: any {c.begin_state.__name__} -> {_describe_end(c.end_state)}{_flags(c)}"
+                    f"  {_command_label(c)}: any {c.begin_state.__name__} -> {_describe_end(c.end_state)}{self._flags(c)}"
                 )
-                lines.extend(_describe_writes(c))
+                lines.extend(self._describe_steps(c))
         return "\n".join(lines)
+
+    def _flags(self, flow: "MiniFlow") -> str:
+        return f"  [{self.policy_for(flow, self.default_policy(flow)).label}]"
+
+    def _describe_steps(self, flow: "MiniFlow") -> list[str]:
+        """The steps inside `flow` with their effective policy. A single Write flow lists its kind."""
+        policy = self.policy_for(flow, self.default_policy(flow))
+        if isinstance(flow, Write):
+            return [f"    Write '{flow.name}': {flow.kind!r}"]
+        lines: list[str] = []
+        if isinstance(flow, (Combine, LinearCombine)):
+            for child in flow.flows:
+                lines.extend(self._describe_child(child, policy, 2))
+        return lines
+
+    def _describe_child(self, step: "MiniFlow", inherited: NullPolicy, depth: int) -> list[str]:
+        policy = self.policy_for(step, inherited)
+        what = f"Write '{step.name}': {step.kind!r}" if isinstance(step, Write) else f"{type(step).__name__} '{step.name}'"
+        lines = [f"{'  ' * depth}{what}  [{policy.label}]"]
+        if isinstance(step, (Combine, LinearCombine)):
+            for child in step.flows:
+                lines.extend(self._describe_child(child, policy, depth + 1))
+        return lines
 
     def validate(self) -> list[str]:
         """Check the graph without running it. Returns a list of problems (empty if none found)."""
@@ -606,6 +792,23 @@ class ApplicationRunnerBase(abc.ABC):
                     problems.append(f"Branch of flow '{f.name}' has candidate {c!r}, which is not a State or Return()")
                 elif isinstance(c, State):
                     branch_targets.setdefault(c, f.name)
+
+        for f in self.flows:
+            for step in _all_steps(f):
+                if isinstance(step, Read) and step.null_policy == MUST:
+                    problems.append(
+                        f"Read '{step.name}' in flow '{f.name}' is marked .must(), but a Read yields no value "
+                        "(it only refuses cancel); mark the enclosing step instead"
+                    )
+                if (
+                    isinstance(step, Write)
+                    and getattr(step.kind, "required", False)
+                    and step.null_policy not in (None, MUST)
+                ):
+                    problems.append(
+                        f"Write '{step.name}' in flow '{f.name}' has required=True (= .must()) but is marked "
+                        f".{step.null_policy.kind}(); the mark wins"
+                    )
 
         for c in self.flows:
             if c.is_command and not any(isinstance(st, c.begin_state) for st in states):
@@ -644,6 +847,11 @@ class ApplicationRunnerBase(abc.ABC):
         return problems
 
     def render(self, flow: MiniFlow):
+        """Show one step (its effective null policy is `current_policy` meanwhile)."""
+        with self.entering(flow):
+            self._dispatch(flow)
+
+    def _dispatch(self, flow: MiniFlow):
         if isinstance(flow, Read):
             self.show_read(flow)
         elif isinstance(flow, Write):
@@ -692,27 +900,54 @@ def _command_label(flow: "MiniFlow") -> str:
     return flow.name if flow.command == flow.name else f"{flow.command} ({flow.name})"
 
 
-def _flags(flow: "MiniFlow") -> str:
-    return "  [cancellable]" if flow.cancellable else ""
-
-
-def _describe_writes(flow: "MiniFlow", depth: int = 2) -> list[str]:
-    """One line per Write inside `flow` (itself included): `Write 'name': kind`."""
-    if isinstance(flow, Write):
-        return [f"{'  ' * depth}Write '{flow.name}': {flow.kind!r}"]
-    lines: list[str] = []
-    if isinstance(flow, (Combine, LinearCombine)):
-        for child in flow.flows:
-            lines.extend(_describe_writes(child, depth))
-    return lines
+def _all_steps(flow: "MiniFlow") -> list["MiniFlow"]:
+    steps = [flow]
+    for child in getattr(flow, "flows", ()) if isinstance(flow, (Combine, LinearCombine)) else ():
+        steps.extend(_all_steps(child))
+    return steps
 
 
 def _describe_end(end) -> str:
     if end is None or end is Return():
         return "Return (back to where it began)"
     if isinstance(end, Branch):
-        return "Branch[" + ", ".join(repr(c) for c in end.candidates) + "]"
+        text = "Branch[" + ", ".join(repr(c) for c in end.candidates) + "]"
+        if end.null_policy is not None and end.null_policy.kind != "must":
+            text += f" (None: {end.null_policy.label})"
+        return text
     return repr(end)
+
+
+def _slot_names(cls: type) -> list[str]:
+    names: list[str] = []
+    for klass in cls.__mro__:
+        slots = klass.__dict__.get("__slots__", ())
+        for name in [slots] if isinstance(slots, str) else slots:
+            if name not in ("__dict__", "__weakref__") and name not in names:
+                names.append(name)
+    return names
+
+
+def restore_in_place(target: Any, snapshot: Any) -> None:
+    """Make `target` equal to `snapshot` (a deep copy of an earlier `target`) without replacing it:
+    dicts and other mappings, lists, and objects with `__dict__` and/or `__slots__` (dataclasses, also
+    `slots=True`). Values inside are the snapshot's copies, so only the top-level object keeps its identity.
+    Other values (None, immutable ones) are left alone."""
+    if isinstance(target, MutableMapping):
+        target.clear()
+        target.update(snapshot)
+        return
+    if isinstance(target, MutableSequence):
+        target[:] = snapshot
+        return
+    for name in _slot_names(type(target)):
+        if hasattr(snapshot, name):
+            object.__setattr__(target, name, getattr(snapshot, name))
+        elif hasattr(target, name):
+            object.__delattr__(target, name)
+    if hasattr(target, "__dict__") and hasattr(snapshot, "__dict__"):
+        target.__dict__.clear()
+        target.__dict__.update(snapshot.__dict__)
 
 
 class Read(MiniFlow):
@@ -737,18 +972,28 @@ class Write(MiniFlow):
         name: Optional[str] = _UNSET,
         kind: Union[Kind, type, None] = None,
         validate: Optional[Callable[..., Optional[str]]] = None,
-        cancellable: Optional[bool] = None,
         command: Optional[str] = None,
     ):
         super().__init__(
-            *args, begin_state=begin_state, end_state=end_state, message=message, name=name,
-            cancellable=cancellable, command=command,
+            *args, begin_state=begin_state, end_state=end_state, message=message, name=name, command=command
         )
         self.kind = _as_kind(kind)
         self.validator = validate
 
+    def own_policy(self) -> Optional[NullPolicy]:
+        if self.null_policy is None and getattr(self.kind, "required", False):
+            return MUST
+        return self.null_policy
+
+    def is_empty(self, raw: Any) -> bool:
+        return self.kind.is_empty(raw)
+
     def accept(self, raw: Any, data: Any = None) -> Any:
-        """Convert and validate what the user entered. Returns the value or raises InvalidInput(message)."""
+        """Convert and validate a (non-empty) answer. Returns the value or raises InvalidInput(message).
+        An empty answer is null; runners check `is_empty` first and apply the null policy. Passed here
+        anyway, it is rejected with "a value is required"."""
+        if self.is_empty(raw):
+            raise InvalidInput(EMPTY_MESSAGE)
         try:
             value = self.kind.convert(raw)
         except ValueError as e:
@@ -767,25 +1012,19 @@ class Write(MiniFlow):
 class Choice(MiniFlow):
     """The user picks one of `choices`. `Choice(["a", "b"], name=...)`; old form `Choice(begin, end, choices, name)`."""
 
-    def __init__(
-        self, *args: Any, begin_state=_UNSET, end_state=_UNSET, choices=_UNSET, name=_UNSET, cancellable=None, command=None
-    ):
-        self.choices = self._setup(args, begin_state, end_state, name, "choices", choices, (), cancellable, command)
+    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, choices=_UNSET, name=_UNSET, command=None):
+        self.choices = self._setup(args, begin_state, end_state, name, "choices", choices, (), command)
 
 
 class Combine(MiniFlow):
     """Child steps shown together (one screen in a GUI). `Combine([...], name=...)`. Children may be any step."""
 
-    def __init__(
-        self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET, cancellable=None, command=None
-    ):
-        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, (), cancellable, command)
+    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET, command=None):
+        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, (), command)
 
 
 class LinearCombine(MiniFlow):
     """Child steps run one after another. `LinearCombine([...], name=...)`. Children may be any step."""
 
-    def __init__(
-        self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET, cancellable=None, command=None
-    ):
-        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, (), cancellable, command)
+    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET, command=None):
+        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, (), command)

@@ -28,9 +28,10 @@ class CancelScriptedTest(unittest.TestCase):
         self.assertIs(result, base.End())
         self.assertEqual(runner.data.display_name, "(not set)")
         self.assertEqual(kinds(runner, "cancel"), [("cancel", "edit-name", "EditName")])
+        self.assertEqual(kinds(runner, "notice"), [("notice", "edit-name", "名前は変更していません")])
         self.assertIn(("profile", "user: alice, name: (not set)"), [(n, t) for k, n, t in runner.transcript if k == "read"])
 
-    def test_finished_steps_stay_and_end_is_not_evaluated(self):
+    def test_exit_restores_finished_steps_and_end_is_not_evaluated(self):
         checked = []
         runner = ScriptedRunner({}, ["go", "a", base.CANCEL, "leave"])
         runner.add_miniflow(base.Read("in", name="enter").begin_end(base.Start(), Area("room")))
@@ -41,31 +42,26 @@ class CancelScriptedTest(unittest.TestCase):
         )
         runner.add_miniflow(base.Read("bye", name="leave").begin_end(Area, base.End()))
         self.assertIs(runner.run(), base.End())
-        self.assertEqual(runner.data, {"one": "a"})  # "one" finished before the cancel; "two" never ran
+        self.assertEqual(runner.data, {})  # "one" finished before the cancel, but `?` means nothing happened
         self.assertEqual(checked, [])
         self.assertEqual([t for k, _, t in runner.transcript if k == "select"], ["go", "leave"])
 
     def test_explicit_flow_is_not_cancellable_by_default(self):
         with self.assertRaises(ValueError) as ctx:
             login([base.CANCEL])
-        self.assertIn("'login' cannot be cancelled", str(ctx.exception))
+        self.assertIn("cannot be cancelled", str(ctx.exception))
 
-    def test_cancellable_override(self):
+    def test_q_on_explicit_flow(self):
         runner = login_example.build_app(ScriptedRunner(login_example.LoginData(), ["alice", base.CANCEL, "alice", "secret", "quit"]))
-        runner.flows[0].cancellable = True  # the login flow
+        runner.flows[0].q()  # the login flow
         self.assertIs(runner.run(), base.End())
         self.assertEqual(kinds(runner, "cancel"), [("cancel", "login", "Password")])
-        step = base.Read("x", cancellable=False).begin(Area)
-        self.assertFalse(step.cancellable)
-        self.assertTrue(base.Read("x").begin(Area).cancellable)
-        self.assertFalse(base.Read("x").begin(base.Start()).cancellable)
-        self.assertTrue(base.Write("x", cancellable=True).cancellable)
-        self.assertTrue(base.Combine([], cancellable=True).cancellable)
+        self.assertEqual(kinds(runner, "notice"), [])  # .q() without a message shows nothing
 
-    def test_non_cancellable_command(self):
+    def test_must_command(self):
         runner = ScriptedRunner({}, ["ask", base.CANCEL])
         runner.add_miniflow(base.Read("in").begin_end(base.Start(), Area("room")))
-        runner.add_miniflow(base.Write("q", name="ask", cancellable=False).begin(Area))
+        runner.add_miniflow(base.Write("q", name="ask").begin(Area).must())
         runner.add_miniflow(base.Read("bye", name="leave").begin_end(Area, base.End()))
         with self.assertRaises(ValueError):
             runner.run()
@@ -73,7 +69,7 @@ class CancelScriptedTest(unittest.TestCase):
     def test_cancel_at_selection_is_an_error(self):
         with self.assertRaises(ValueError) as ctx:
             login(["alice", "secret", base.CANCEL])
-        self.assertIn("no flow cannot be cancelled", str(ctx.exception))
+        self.assertIn("no flow is running", str(ctx.exception))
 
 
 class QuitTest(unittest.TestCase):
@@ -92,10 +88,15 @@ class QuitTest(unittest.TestCase):
 
 class OnRejectTest(unittest.TestCase):
     def test_next_records_and_reasks(self):
-        runner, result = login(["alice", "secret", "edit-name", "   ", "Bob", "quit"], on_reject="next")
+        runner, result = login(["alice", "secret", "edit-name", "x" * 21, "Bob", "quit"], on_reject="next")
         self.assertIs(result, base.End())
         self.assertEqual(runner.data.display_name, "Bob")
-        self.assertEqual(kinds(runner, "rejected"), [("rejected", "EditName", "name must not be blank")])
+        self.assertEqual(kinds(runner, "rejected"), [("rejected", "EditName", "name must be at most 20 characters")])
+
+    def test_next_with_empty_answer_at_must_step(self):
+        runner, result = login(["", "alice", "secret", "quit"], on_reject="next")
+        self.assertIs(result, base.End())
+        self.assertEqual(kinds(runner, "rejected"), [("rejected", "Username", "a value is required")])
 
     def test_choice_rejection(self):
         runner = ScriptedRunner({}, ["green", "red"], on_reject="next")
@@ -151,16 +152,17 @@ class CommandAliasTest(unittest.TestCase):
         runner.add_miniflow(base.Read(name="leave", command="l").begin_end(Area, base.End()))
         self.assertEqual(runner.validate(), ["commands 'list' and 'leave' are both typed as 'l' at Area(room)"])
 
-    def test_describe_shows_alias_kinds_and_cancellable(self):
+    def test_describe_shows_alias_kinds_and_policies(self):
         runner = login_example.build_app(ScriptedRunner(login_example.LoginData()))
         runner.flows[2]._command = "e"  # edit-name
         text = runner.describe()
         self.assertIn("LoggedIn(home)  commands: profile, e (edit-name), logout, quit", text)
-        self.assertIn("e (edit-name): any LoggedIn -> Return (back to where it began)  [cancellable]", text)
-        self.assertIn("login: Start() -> Branch[LoggedIn(home), Return()]\n", text)  # not cancellable: no mark
-        self.assertIn("    Write 'Username': Text(required=True)", text)
-        self.assertIn("    Write 'Password': Password(required=False)", text)
-        self.assertIn("    Write 'EditName': Text(required=False)", text)
+        self.assertIn("e (edit-name): any LoggedIn -> Return (back to where it began)  [? '名前は変更していません']", text)
+        self.assertIn("login: Start() -> Branch[LoggedIn(home)] (None: ? 'パスワードが違います')  [!]\n", text)
+        self.assertIn("    Write 'Username': Text(required=False)  [!]", text)
+        self.assertIn("    Write 'Password': Password(required=False)  [!]", text)
+        self.assertIn("    Write 'EditName': Text(required=False)  [? '名前は変更していません']", text)
+        self.assertIn("profile: any LoggedIn -> Return (back to where it began)  [?]", text)
 
 
 # --- CUI ------------------------------------------------------------------------------------------
@@ -188,7 +190,8 @@ class CuiCancelQuitTest(unittest.TestCase):
         )
         self.assertIs(result, base.End())
         self.assertEqual(data.display_name, "(not set)")
-        self.assertEqual(out.count("(type :q or press Ctrl-D to cancel"), 1)
+        self.assertEqual(out.count("(type :q, leave it empty or press Ctrl-D to cancel 'edit-name')"), 1)
+        self.assertEqual(out.count("[!] 名前は変更していません"), 2)
         self.assertEqual(out.count("(cancelled 'edit-name')"), 2)
 
     def test_eof_cancels_then_eof_at_prompt_quits(self):
@@ -228,7 +231,7 @@ class CuiCancelQuitTest(unittest.TestCase):
 
     def test_repeated_eof_does_not_loop(self):
         def build(runner):
-            runner.add_miniflow(base.Write("x", cancellable=True).begin_end(base.Start(), base.End()))
+            runner.add_miniflow(base.Write("x").begin_end(base.Start(), base.End()).q())
             return runner
 
         _, result, out, _ = run_cui(build, {}, [EOFError()] * 3)
@@ -311,9 +314,12 @@ except ImportError:  # pragma: no cover - PySide6 missing
 def drive(runner, steps):
     """Run each step (returns True once it acted) from a timer while runner.run() waits for the user."""
     todo = list(steps)
+    deadline = QtCore.QDeadlineTimer(10000)  # a step that never acts must not hang the test run
 
     def tick():
-        if todo and todo[0]():
+        if deadline.hasExpired():
+            runner.main_window.close()
+        elif todo and todo[0]():
             todo.pop(0)
 
     timer = QtCore.QTimer()
@@ -399,12 +405,11 @@ class GuiTest(unittest.TestCase):
             if runner.form is None or visible_button(runner, "form") is not None:
                 return False
             seen["after_cancel"] = dict(data)
-            edits = [e for e in runner.form.findChildren(QtWidgets.QLineEdit) if not isinstance(e.parent(), QtWidgets.QAbstractSpinBox)]
+            edits = runner.form.findChildren(QtWidgets.QLineEdit)
             edits[0].setText("Ann")
             edits[1].setText("Lee")
-            spin = runner.form.findChildren(QtWidgets.QSpinBox)[0]
-            spin.setValue(7)
-            QTest.keyClick(spin, QtCore.Qt.Key.Key_Return)  # Enter in the last field = Next
+            QTest.keyClicks(edits[2], "7x")  # the number field's validator drops the "x"
+            QTest.keyClick(edits[2], QtCore.Qt.Key.Key_Return)  # Enter in the last field = Next
             return True
 
         def close():
@@ -457,7 +462,7 @@ class GuiTest(unittest.TestCase):
         result, _ = drive(runner, [press_escape])
         self.assertIs(result, base.End())
         self.assertIsNone(seen["cancel"])
-        self.assertEqual(seen["status"], "'x' cannot be cancelled")
+        self.assertEqual(seen["status"], "'x' cannot be cancelled here")
 
 
 if __name__ == "__main__":

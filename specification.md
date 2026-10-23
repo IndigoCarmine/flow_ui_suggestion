@@ -33,13 +33,34 @@ Flow UI Frameworkは、アプリケーションの振る舞いを「状態（Sta
 - **終了の扱い**:
   - `end_state` を省略、または `Return()` の場合: フローを始めた状態（実行開始時の現在状態）へ戻る。戻るのは1段だけで、呼び出しスタックやコマンドの入れ子は持たない。
   - Stateを指定した場合: その状態へ進む（例: ログアウトは `begin_end(LoggedIn, start)`）。
-- **キャンセル**: `cancellable`（既定: コマンドフローはTrue、明示的なフローはFalse。全てのMiniFlowで `cancellable=` 指定可、`None` で既定に戻す）。判定するのは選ばれて実行中のトップレベルのフローの値だけ。Runnerはキャンセルを `base.Cancelled` として送出し、基底の `run()` が受けて現在状態をフローの開始状態に戻す。`end_state`（Branchの `check`）は評価せず、残りのステップの `data_update` も行わない。既に終わったステップの更新は取り消さない（トランザクションではない）。自動実行されるフロー（明示的なフローが1つでコマンド無し）をキャンセル可能にすると、戻った状態で再び自動実行される。
-  - CUI: `:q` 単独の入力、またはEOF（Ctrl-D）。キャンセル可能なフローで初めて入力を求めるときに1回だけヒントを表示。キャンセルできないときの `:q` はヒントを出して聞き直す。
-  - GUI: Cancelボタン（キャンセル可能なときだけ）とEsc。キャンセルできないときのEscはステータスバーにヒント。
-  - ScriptedRunner: 答え `base.CANCEL`。キャンセルできないときは `ValueError`。
+- **nullの扱い**: 下の 3.3 を参照。
 - **コマンドの別名**: `command="e"`（空白を含まない短い名前、既定は `name`）。CUIは別名・名前の完全一致、なければ別名・名前の一意な前方一致で選ぶ（複数当てはまれば候補を示して聞き直す）。ScriptedRunnerは名前か別名の完全一致。
 - **グローバルコマンド**: `begin_state` に `State` そのものを渡すと、`End` 以外の全ての状態（`Start` を含む）で候補になる。
-- **Branch（分岐）**: `Branch(check, candidates)`。`check(data)` がStateを返し、そこへ進む。分岐先は `candidates` として宣言するのでグラフを静的に列挙できる。返り値が候補のどれでもない場合（Stateの等価性で比較。`Return()` は候補に含めたときのみ可）は実行時エラーとする。
+- **Branch（分岐）**: `Branch(check, candidates)`。`check(data)` がStateを返し、そこへ進む。分岐先は `candidates` として宣言するのでグラフを静的に列挙できる。返り値が候補のどれでもない場合（Stateの等価性で比較。`Return()` は候補に含めたときのみ可）は実行時エラーとする。ただし `check` がNoneを返し、Branchに `.q(...)` か `.opt()` が付いている場合は 3.3 に従う。
+
+### 3.3 nullの扱い（`?` / `!` / `opt`）
+「ユーザーが値をくれなかった」ことを **null** と呼ぶ。nullになるのは次の場合:
+- キャンセル: CUIの `:q` 単独の入力またはEOF（Ctrl-D）、GUIのEsc / Cancel（Skip）ボタン、ScriptedRunnerの答え `base.CANCEL`。
+- 空の入力: `Kind.is_empty(raw)`（既定: Noneか、空・空白だけの文字列）。Text・Password・Number・YesNoの文字入力。Choiceは空の入力（CUI）・`None`/`""`（ScriptedRunner。選択肢そのものでない場合）・`opt` のときだけ現れる「(none)」項目（GUI）。GUIのYesNo（チェックボックス）はキャンセル以外でnullにならない。
+- `Branch` の `check` がNoneを返したとき。
+
+nullのときの振る舞い（null policy, `base.NullPolicy`）はステップに流れるような（自分を返す）メソッドで書く。PythonにはRustの `?` やKotlinの `!!` のような後置演算子が無いため、短いメソッド名にした。
+- `.q(message=None)`（`?`）: 実行中のトップレベルのフローを抜け、フローを始めた状態へ戻る。`end_state`（Branchの `check`）は評価しない。**dataはフロー開始時のスナップショットに戻す**（何も起きなかったことにする）。`message` があれば、戻った後に `show_notice(message)` で表示する。
+- `.must()`（`!`）: nullを許さない。空の入力は「a value is required」を示して聞き直し、キャンセルはヒントを出して断る（ScriptedRunnerは空の答えを拒否として扱い、`CANCEL` は `ValueError`）。`Text(required=True)`（`Password` も）は、そのWriteに `.must()` を付けたのと同じ。
+- `.opt()`: nullを受け入れ、`data_update` にNoneを渡して続ける（GUIの画面全体のSkipでは、その画面の全ての入力ステップにNone）。Readでのキャンセルは単に先へ進む。
+
+**実際に効く扱い**（`runner.policy_for(step, inherited)`）: ステップ自身の印 → 一番近い印の付いた（または実際に効く扱いを持つ）外側の `Combine` / `LinearCombine` → トップレベルの既定（コマンドフローなら `?`、明示的なフローは `!`）。Runnerは表示中のステップの扱いを `current_policy` として持つ（`render()` が `entering(step)` で積む。1画面にまとめて表示するBackendは子ごとに `policy_for` / `entering` を使う）。Backendはnullを受けたら `null_given(step)` を呼ぶ: `?` なら `Cancelled` を送出、`opt` ならTrue（Noneを保存）、`!` ならFalse（聞き直し・断る）。
+
+**Branch**: Branchの印はBranch自身のものだけで、フローからは継承しない。`check` がNoneを返したとき、`.q(message)` なら上の `?` と同じ（ロールバックと通知）、`.opt()` ならロールバックも通知も無しでフローを始めた状態へ戻る、印が無いか `.must()` なら候補外としてエラー。
+
+**ロールバック**: 基底の `run()` はフローを選んだ直後（`render` の前）に `copy.deepcopy(data)` を取り、`?` で抜けたら `restore_in_place(data, snapshot)` で **同じオブジェクトのまま** 中身を書き戻す。対応: `MutableMapping`（clear + update）、`MutableSequence`（全体を置換）、`__slots__`（`dataclass(slots=True)` を含む。継承した全てのslotを書き戻し、スナップショットに無いslotは消す）、`__dict__`（clear + update）。それ以外（Noneや不変の値）は何もしない。書き戻した値はスナップショット側のコピーなので、トップレベルのdataオブジェクトの同一性だけが保たれる（中のlistなどは別オブジェクトになる）。`deepcopy` に失敗した場合は `warn()` で警告し、そのフローはロールバックしない。これによりCUIとGUIは同じ結果になる（以前はCUIだけが抜ける前に入力済みの欄を残していた）。
+
+**通知**（`show_notice(text)`、Backendが実装する抽象メソッド）: CUIは `[!] text` を表示。GUIは次に表示する画面の上部（objectName `notice` のラベル）とステータスバーに表示。ScriptedRunnerは `("notice", フロー名, text)` を `transcript` に記録する。抜けたことは `exited(flow, step)` フックでも通知される（CUIは `(cancelled 'フロー名')` を表示、ScriptedRunnerは `("cancel", フロー名, ステップ名)` を記録。Branchのときステップ名は `"Branch"`）。
+
+**各Runtimeの表示**:
+- CUI: `?` のステップで初めて入力を求めるときに1回だけ「`:q`、空のまま、Ctrl-Dでキャンセル」のヒントを表示。`opt` の入力欄は `(optional)` を付ける。`!` での `:q` は `'フロー名' cannot be cancelled here` を表示して聞き直す。`:q` をフローの外（選択プロンプト）で使うと「nothing to cancel here」。
+- GUI: 画面の扱いが `?` ならCancelボタン、`opt` ならSkipボタン（どちらもEscと同じ）。`!` ならボタンは無く、Escはステータスバーにヒント。入力欄ごとの扱いはNextを押したときに判定し、空の `?` 欄があればフローを抜け、空の `!` 欄には「a value is required」を表示する。
+- 自動実行されるフロー（明示的なフローが1つでコマンド無し）に `?` を付けると、戻った状態で再び自動実行される。
 
 ## 4. プリミティブ・インタラクション
 MiniFlowの具体的な実装として、以下の基本インタラクションを定義する。
@@ -51,15 +72,15 @@ MiniFlowの具体的な実装として、以下の基本インタラクション
 
 ### 4.1 入力の種類（kind）
 `Write(..., kind=...)` は「どんな値が欲しいか」という意図であり、ウィジェットの指定ではない。Runnerが入力方法を決め、`data_update` には変換済みの値を渡す。
-- `Text(required=False)`（既定）: str。`required=True` なら空白だけの入力を拒否する。
+- `Text(required=False)`（既定）: str。空・空白だけの入力はnull（3.3）。`required=True` は `.must()` の別名。
 - `Password(required=False)`: 入力中に表示しないstr（CUIは `getpass`、ただしstdinが端末でなければ通常の入力。GUIは伏せ字の入力欄）。
-- `Number(min=None, max=None, decimals=0)`: `decimals=0` ならint、それ以外はfloat。範囲外・数でない入力を拒否する（GUIはスピンボックス）。
-- `YesNo()`: bool。文字列なら y/yes/true/1 と n/no/false/0（GUIはチェックボックス）。
-- 独自のkindは `Kind` を継承し、`convert(raw)`（失敗時は `ValueError(メッセージ)`）と `check(value)`（エラーメッセージかNone）を実装する。
+- `Number(min=None, max=None, decimals=0)`: `decimals=0` ならint、それ以外はfloat。範囲外・数でない入力を拒否する。空の入力はnull（`.opt()` ならNone）。GUIは空にできるよう、スピンボックスではなく数字だけを受け付けるQLineEdit（範囲はプレースホルダに表示）。
+- `YesNo()`: bool。文字列なら y/yes/true/1 と n/no/false/0、空はnull（GUIはチェックボックス）。
+- 独自のkindは `Kind` を継承し、`convert(raw)`（失敗時は `ValueError(メッセージ)`）と `check(value)`（エラーメッセージかNone）を実装する。何をnullとみなすかは `is_empty(raw)` で変えられる。
 
 ### 4.2 入力の検証（validate）
 - `Write(..., validate=f)`: `f(value)` または `f(data, value)` がエラーメッセージ（またはNone）を返す。
-- 順序: kindの変換 → kindの検査 → `validate`。`Write.accept(raw, data)` が値を返すか `InvalidInput(メッセージ)` を送出する。
+- 順序: nullの判定（`is_empty`。nullなら 3.3 に従い、以降は行わない） → kindの変換 → kindの検査 → `validate`。`Write.accept(raw, data)` が値を返すか `InvalidInput(メッセージ)` を送出する（空の値を直接渡すと「a value is required」）。
 - 拒否された場合、Runnerはメッセージを示して聞き直す（CUIはメッセージを表示して再入力、GUIは画面を保ったまま入力欄の下に表示、ScriptedRunnerはメッセージ付きの `InvalidInput` を送出）。拒否された値は `data_update` に渡さない。GUIのCombineでは、全ての入力が受け入れられたときだけまとめて `data_update` する。
 
 ## 5. Runtime（実行時エンジン）の役割
@@ -82,22 +103,22 @@ Runtimeは、定義されたグラフを解釈し、実際のプラットフォ�
    - それ以外で候補がある場合：Runnerの `select_flow(flows, commands)` でユーザーに選ばせる。コマンドは必ずユーザーが選ぶ（自動実行すると同じコマンドが繰り返されるため）。BackendはコマンドをCUIならプロンプト、GUIなら別のボタン列のように通常のフローと区別して表示してよい。
    - 候補が無い場合：停止する。
 3. `MiniFlow` のインタラクション（表示・入力）が完了するまで待機する（入力は受け入れられるまで聞き直す）。
-4. インタラクション完了後、`end_state` から次の状態を決める（`Branch` なら `check` を評価し、`None`/`Return()` ならフローを始めた状態に戻る）。
+4. インタラクション完了後、`end_state` から次の状態を決める（`Branch` なら `check` を評価し、`None`/`Return()` ならフローを始めた状態に戻る。`check` がNoneを返したときは 3.3）。途中で `?` のnullが起きたら、dataをフロー開始時に戻し、フローを始めた状態に戻って通知を出す。
 5. 現在の状態が `End` に達するまで 2-4 を繰り返す。
 6. `run()` は最後の状態を返し、`runner.result` にも保持する: `End()`、ユーザーが終了したら `base.QUIT`（`Quit()` の唯一のインスタンス。Stateではない。終了時の状態は `current_state` に残る）、候補が無く停止したらその状態。
 
 ### 6.1 アプリの終了
 - Runnerはユーザーの終了を `base.UserQuit` として送出し、`run()` がそれを受けて `QUIT` を返す。アプリ側の終了コールバックは設けない。
 - GUI: 入力待ちの間にウィンドウが閉じられたら終了。
-- CUI: Ctrl-C（どこでも）、選択プロンプトやキャンセルできないフローでのEOFで、短いメッセージを出して終了（トレースバックを出さない）。キャンセル可能なフローでのEOFはキャンセルだが、入力の無いままEOFが続いた2回目は終了とする（パイプ入力が尽きたときの無限ループ防止）。
+- CUI: Ctrl-C（どこでも）、選択プロンプトや `!` のステップでのEOFで、短いメッセージを出して終了（トレースバックを出さない）。`?` / `opt` のステップでのEOFはnull（キャンセル）だが、入力の無いままEOFが続いた2回目は終了とする（パイプ入力が尽きたときの無限ループ防止）。
 - ScriptedRunner: 答え `base.QUIT`。
 
 - `context_build` の文字列: `{...}` を含めばdataの属性/キーで埋めるテンプレート（欠けていれば `message`）。含まなければ、dataの属性/キー名ならその値、そうでなければそのままの文として表示する。
 
 ## 7. 静的検査
 Runnerは実行前にグラフを検査できる。
-- `describe()`: 状態、明示的なフロー、Branchの候補、状態ごとに使えるコマンド（別名は `別名 (名前)`）を文字列で返す。キャンセル可能なフローには `[cancellable]`、各フローの下にはその中のWriteとkind（例: `Write 'Age': Number(min=0, max=150, decimals=0)`）を示す。
-- `validate()`: 問題の一覧（文字列のリスト）を返す。検出するもの: `Start` から始まるフローが無い／出口の無い状態（`End` 以外。その型に当てはまるコマンドも出口に数える）／`Start` から到達できない状態／行き先の無い、またはState・`Return()` 以外のBranch候補／どの状態の型にも当てはまらないコマンド／同じ状態で同じ別名（`command`）になるコマンド。
+- `describe()`: 状態、明示的なフロー、Branchの候補、状態ごとに使えるコマンド（別名は `別名 (名前)`）を文字列で返す。各フローの行の末尾に実際に効くnullの扱い（`[?]`, `[? 'メッセージ']`, `[!]`, `[opt]`）、印の付いたBranchには `(None: ? 'メッセージ')` を付ける。Combine/LinearCombineの下には子のステップを入れ子で並べ、それぞれの扱いとWriteのkind（例: `Write 'Age': Number(min=0, max=150, decimals=0)  [opt]`）を示す。Write単独のフローはそのkindを示す。
+- `validate()`: 問題の一覧（文字列のリスト）を返す。検出するもの: `Start` から始まるフローが無い／出口の無い状態（`End` 以外。その型に当てはまるコマンドも出口に数える）／`Start` から到達できない状態／行き先の無い、またはState・`Return()` 以外のBranch候補／どの状態の型にも当てはまらないコマンド／同じ状態で同じ別名（`command`）になるコマンド／`.must()` を付けた `Read`（値を返さないので、キャンセルを断る以外の意味が無い）／`required=True` なのに `.q()` / `.opt()` を付けたWrite（印が優先される）。`?` は全てのフローに戻り先（フローを始めた状態）があるので検査しない。
 - `run()` は開始時に `validate()` を呼び、問題があれば `warn()`（既定では標準エラー出力）で警告して実行を続ける。
 
 ## 8. Runtimeの選択
@@ -105,4 +126,4 @@ Runnerは実行前にグラフを検査できる。
 - 優先順位: 引数 `backend` > コマンドライン `--cui` / `--gui` > 環境変数 `FLOW_UI_BACKEND` > 自動判定。
 - 自動判定: 画面があり（Linux等では `DISPLAY` か `WAYLAND_DISPLAY`、macOS/Windowsは常にあるとみなす）、PySide6が読み込めればGUI、そうでなければCUI。画面があるのにPySide6の読み込みに失敗した場合は、理由を標準エラー出力に1行出す。GUIモジュールは選ばれたときだけ読み込む。
 - アプリのコードは `base` と `runtime` だけを使い、Backendを直接importしない。
-- `scripted.ScriptedRunner(data, answers)` は画面を持たないBackendで、決められた答えで実行し、表示内容を `transcript` に記録する（テスト用）。答えが尽きると `ScriptExhausted`。Writeの答えはkind・validateで変換・検査し、拒否されれば `InvalidInput`（Choiceの範囲外は `ValueError`）。`on_reject="next"` なら拒否を `("rejected", 名前, メッセージ)` として `transcript` に記録し、次の答えを使う。`base.CANCEL` / `base.QUIT` はキャンセル・終了の操作を表す。
+- `scripted.ScriptedRunner(data, answers)` は画面を持たないBackendで、決められた答えで実行し、表示内容を `transcript` に記録する（テスト用）。答えが尽きると `ScriptExhausted`。Writeの答えはkind・validateで変換・検査し、拒否されれば `InvalidInput`（Choiceの範囲外は `ValueError`）。`on_reject="next"` なら拒否を `("rejected", 名前, メッセージ)` として `transcript` に記録し、次の答えを使う。`base.CANCEL`・`None`・`""` はnull（3.3）、`base.QUIT` は終了の操作を表す。通知は `("notice", フロー名, 文)`。
