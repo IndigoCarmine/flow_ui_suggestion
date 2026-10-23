@@ -46,14 +46,21 @@ class CuiRunner(base.ApplicationRunnerBase):
         val = input(f"{prompt}: ")
         flow.apply_update(self.data, val)
 
-    def select_flow(self, flows):
-        print("\nMultiple flows available. Select one:")
+    def select_flow(self, flows, commands):
+        print(f"\n[{self.current_state}]")
         for i, f in enumerate(flows):
             print(f"{i}: {f.name}")
+        if commands:
+            print("Commands: " + "  ".join(c.name for c in commands))
+        by_name = {c.name: c for c in commands}
         while True:
+            text = input(f"{self.current_state.name or ''}> ").strip()
+            if text in by_name:
+                return by_name[text]
             try:
-                idx = int(input("Select flow: "))
+                idx = int(text)
                 if 0 <= idx < len(flows):
                     return flows[idx]
             except ValueError:
                 pass
+            print("Enter a flow number or a command name.")

@@ -6,36 +6,40 @@ Flow UI Frameworkは、アプリケーションのUIをプログラムするの�
 従来のUI開発では、開発者が目標とするUserの作業を考えながら、画面のレイアウトとデータ構造を構築するという流れでした。そこで、各ステート間での一連作業（MiniFlow）を組み立て、それをNodeGraphで管理する形のみを記述させるようにしました。具体的な描画やインタラクションの詳細は、実行環境（Runtime）に完全に委譲されます。
 
 今のところUserが何をするかを基準にClass名を決めています。
-例えば以下のように記述できるべきです。
+例えば以下のように記述できます（実際に動くものは `login_example.py`。`uv run python login_example.py` でCUI、`uv run python login_example.py gui` でGUI）。
 
 ```python
-data = UseData()
-check_state = State("check")
-login_state = State("login")
-login = Combine(Write("write your username",data.name), Write("write your password",data.password).begin_end(Start(), check_state)
+import base, cui
 
-def check()->State:
-    if is_exist_user(data):
-        return login_state
-    else:
-        return Start()
-auth = Wait(lambda: check_user)
+class LoggedIn(base.State):  # 「ログイン中」という種類の状態
+    pass
 
-service = Read("seacret infomation").begin_end(login_state, login_state)
-exit = Read("app stopping").begin_end(login_state,End())
+start, home, end = base.Start("start"), LoggedIn("home"), base.End("end")
+data = LoginData()
 
-runner = ApplicationRunner()
-runner.add_miniflow(login)
-runner.add_miniflow(auth)
-runner.add_miniflow(service)
-runner.add_miniflow(exit)
+def check(data) -> base.State:
+    return home if is_exist_user(data) else base.Return()  # 失敗したら開始点へ戻る
 
+# 明示的なフロー: startから始まり、Branchで home か Return() に分岐する
+login = base.LinearCombine(
+    flows=[
+        base.Write(message="username", name="Username").data_update("username"),
+        base.Write(message="password", name="Password").data_update("password"),
+    ],
+    name="login",
+).begin_end(start, base.Branch(check, [home, base.Return()]))
+
+# コマンドフロー: 型(LoggedIn)から始まり、LoggedInのどの状態からでも選べる。
+# endを省略すると、実行前の状態へ戻る。
+profile = base.Read(name="profile").context_build("user: {username}").begin(LoggedIn)
+logout = base.Read(message="logged out", name="logout").begin_end(LoggedIn, start)
+quit_app = base.Read(message="bye", name="quit").begin_end(LoggedIn, end)
+
+runner = cui.CuiRunner(data)
+for flow in [login, profile, logout, quit_app]:
+    runner.add_miniflow(flow)
 runner.run()
 ```
-
-
-
-
 
 ## 2. 設計思想：Logic-First, Rendering-Last
 本フレームワークの根底には、以下の思想があります。
@@ -47,11 +51,12 @@ runner.run()
 ## 3. コアコンポーネント
 
 - **State (状態)**: アプリケーションの特定の瞬間を表すチェックポイントです（Start, Endなど）。
-- **MiniFlow (インタラクション)**: 状態間の遷移（エッジ）であり、ユーザーとの対話を定義します。
+- **MiniFlow (インタラクション)**: 状態間の遷移（エッジ）であり、ユーザーとの対話を定義します。`begin` にStateのインスタンスを渡すと明示的なフロー、Stateの型（サブクラス）を渡すとその型の状態ならどこでも選べるコマンドフローになります。`end` を省略（または `Return()`）すると、フローを始めた状態へ戻ります。
     - `Read`: ユーザーが読む＝ユーザーへの情報提示を行います。
     - `Write`: ユーザーが書く＝ユーザーからの情報入力を要求します。
     - `Choice`: 選択肢を提示します。
     - `LinearCombine`: 複数の対話を一続きのシーケンスとして実行します。
+- **Branch (分岐)**: `Branch(check, candidates)` をフローの `end` に置くと、`check(data)` が返したStateへ進みます。返り値は `candidates` のどれか（`Return()` も可）でなければエラーになります。
 - **DataContext**: 状態間で共有されるデータコンテキストです。`data_update`（書き込み）と `context_build`（読み出し・構築）を通じて、型安全にデータを扱えます。
 
 ## 4. アーキテクチャ

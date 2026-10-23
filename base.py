@@ -19,10 +19,57 @@ class End(State):
     pass
 
 
-class MiniFlow:
-    """Backend-independent step. It only holds data; the runner decides how to render it."""
+class Return:
+    """End marker: go back to the state the flow started from. `Return()` is always the same object."""
 
-    def __init__(self, begin_state: State, end_state: State, message: str, name: str):
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "Return()"
+
+
+class Branch:
+    """End of a flow that splits: `check(data)` returns one of the declared `candidates`."""
+
+    def __init__(self, check: Callable[..., Any], candidates: list[Any]):
+        self.check = check
+        self.candidates = candidates
+
+    def resolve(self, data: Any):
+        result = _call_with_data(self.check, data)
+        if not any(result is c for c in self.candidates):
+            raise ValueError(
+                f"Branch check returned {result!r}, which is not one of its candidates {self.candidates!r}"
+            )
+        return result
+
+
+def _call_with_data(func: Callable, data: Any):
+    if len(inspect.signature(func).parameters) == 0:
+        return func()
+    return func(data)
+
+
+class MiniFlow:
+    """Backend-independent step. It only holds data; the runner decides how to render it.
+
+    begin_state: a State instance (explicit flow) or a State subclass (command flow,
+    offered at every state that is an instance of it).
+    end_state: a State, a Branch, Return(), or None (None means the same as Return()).
+    """
+
+    def __init__(
+        self,
+        begin_state: Union[State, type, None] = None,
+        end_state: Union[State, Branch, Return, None] = None,
+        message: str = "",
+        name: str = "",
+    ):
         self.name = name
         self.begin_state = begin_state
         self.end_state = end_state
@@ -32,6 +79,23 @@ class MiniFlow:
         # Data handling
         self._data_update_func: Optional[Union[Callable, str]] = None
         self._context_build_func: Optional[Union[Callable, str]] = None
+
+    def begin(self, state_or_type: Union[State, type]):
+        self.begin_state = state_or_type
+        return self
+
+    def begin_end(
+        self,
+        begin: Union[State, type],
+        end: Union[State, Branch, Return, None],
+    ):
+        self.begin_state = begin
+        self.end_state = end
+        return self
+
+    @property
+    def is_command(self) -> bool:
+        return isinstance(self.begin_state, type)
 
     def data_update(
         self,
@@ -59,10 +123,7 @@ class MiniFlow:
                     return getattr(data, self._context_build_func, self.message)
             return self.message
 
-        sig = inspect.signature(self._context_build_func)
-        if len(sig.parameters) == 0:
-            return self._context_build_func()
-        return self._context_build_func(data)
+        return _call_with_data(self._context_build_func, data)
 
     def apply_update(self, data: Any, value: Any):
         if not self._data_update_func:
@@ -105,20 +166,37 @@ class ApplicationRunnerBase(abc.ABC):
         self.current_state = self.start_state
 
         while not isinstance(self.current_state, End):
-            available_flows = [
-                f for f in self.flows if f.begin_state == self.current_state
-            ]
+            flows, commands = self.flows_for(self.current_state)
 
-            if not available_flows:
+            if not flows and not commands:
                 print(f"DEBUG: No transitions from {self.current_state}")
                 break
 
-            selected_flow = available_flows[0]
-            if len(available_flows) > 1:
-                selected_flow = self.select_flow(available_flows)
+            if len(flows) == 1 and not commands:
+                selected_flow = flows[0]
+            else:
+                selected_flow = self.select_flow(flows, commands)
 
+            origin = self.current_state
             self.render(selected_flow)
-            self.current_state = selected_flow.end_state
+            self.current_state = self.resolve_end(selected_flow.end_state, origin)
+
+    def flows_for(self, state: State) -> tuple[list[MiniFlow], list[MiniFlow]]:
+        """Explicit flows that begin at this state, and command flows whose type matches it."""
+        flows = [f for f in self.flows if not f.is_command and f.begin_state is state]
+        commands = []
+        if not isinstance(state, End):
+            commands = [
+                f for f in self.flows if f.is_command and isinstance(state, f.begin_state)
+            ]
+        return flows, commands
+
+    def resolve_end(self, end, origin: State) -> State:
+        if isinstance(end, Branch):
+            end = end.resolve(self.data)
+        if end is None or end is Return():
+            return origin
+        return end
 
     def render(self, flow: MiniFlow):
         flow.is_complete = False
@@ -157,8 +235,8 @@ class ApplicationRunnerBase(abc.ABC):
         """Show all child flows together."""
 
     @abc.abstractmethod
-    def select_flow(self, flows: list[MiniFlow]) -> MiniFlow:
-        pass
+    def select_flow(self, flows: list[MiniFlow], commands: list[MiniFlow]) -> MiniFlow:
+        """Let the user pick one of the explicit flows or commands available at the current state."""
 
 
 class Read(MiniFlow):
@@ -170,18 +248,18 @@ class Write(MiniFlow):
 
 
 class Choice(MiniFlow):
-    def __init__(self, begin_state, end_state, choices, name):
+    def __init__(self, begin_state=None, end_state=None, choices=(), name=""):
         super().__init__(begin_state, end_state, "", name)
         self.choices = choices
 
 
 class Combine(MiniFlow):
-    def __init__(self, begin_state, end_state, flows, name):
+    def __init__(self, begin_state=None, end_state=None, flows=(), name=""):
         super().__init__(begin_state, end_state, "", name)
         self.flows = flows
 
 
 class LinearCombine(MiniFlow):
-    def __init__(self, begin_state, end_state, flows, name):
+    def __init__(self, begin_state=None, end_state=None, flows=(), name=""):
         super().__init__(begin_state, end_state, "", name)
         self.flows = flows

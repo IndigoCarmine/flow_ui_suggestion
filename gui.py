@@ -70,7 +70,7 @@ class GuiRunner(base.ApplicationRunnerBase):
             self.app.processEvents()
             QtCore.QThread.msleep(10)
 
-    def select_flow(self, flows):
+    def select_flow(self, flows, commands):
         selected = [None]
 
         def set_selected(f):
@@ -81,10 +81,22 @@ class GuiRunner(base.ApplicationRunnerBase):
             if item.widget():
                 item.widget().setParent(None)
 
+        self.layout.addWidget(QtWidgets.QLabel(str(self.current_state)))
         for f in flows:
             btn = QtWidgets.QPushButton(f.name)
             btn.clicked.connect(lambda _, f_val=f: set_selected(f_val))
             self.layout.addWidget(btn)
+
+        if commands:
+            # Commands go in their own row so they read as "always available here".
+            row = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.addWidget(QtWidgets.QLabel("Commands:"))
+            for c in commands:
+                btn = QtWidgets.QPushButton(c.name)
+                btn.clicked.connect(lambda _, c_val=c: set_selected(c_val))
+                row_layout.addWidget(btn)
+            self.layout.addWidget(row)
 
         self.central_widget.update()
         self.app.processEvents()
