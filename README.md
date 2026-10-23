@@ -73,6 +73,15 @@ runtime.run(build_app, data)  # CUI/GUIはアプリのコードでは選ばな�
     | `YesNo()` | bool | `[y/n]` | QCheckBox |
 
 - **入力の検証 (validate)**: `Write(..., validate=f)`。`f(value)` または `f(data, value)` がエラーメッセージ（またはNone）を返します。kindの検査（数値の範囲、`required`）の後に呼ばれます。拒否されるとRuntimeがメッセージを見せて聞き直します（CUIは再表示、GUIは画面を保ったまま入力欄の下に表示、ScriptedRunnerはメッセージ付きの `base.InvalidInput` を送出）。拒否された値は `data_update` に渡りません。
+- **キャンセル (cancellable)**: 「ユーザーが途中でやめる」も意図の一つで、全てのRuntimeが扱います。コマンドフローは既定でキャンセル可能、明示的なフローは不可で、どのフローでも `cancellable=True/False` で変えられます（実行中のトップレベルのフローの設定だけが効きます）。キャンセルするとフローを始めた状態へ戻り、`end`（Branchの `check` も）は評価しません。残りのステップの `data_update` は行いませんが、**それまでに終わったステップ（LinearCombineの前半、CUIのCombineで入力済みの欄）の更新は残ります**。GUIのCombineは「次へ」でまとめて更新するので、キャンセルすれば何も更新されません。
+    - CUI: `:q` だけを入力するか Ctrl-D（EOF）。最初に1回だけヒントを表示します。
+    - GUI: Cancelボタン（キャンセル可能なときだけ表示）か Esc。
+    - ScriptedRunner: 答えに `base.CANCEL`。
+    - キャンセルできないフローで `:q` / Esc を使うと、CUIとGUIはヒントを出して無視、ScriptedRunnerは `ValueError` です。
+- **終了**: `run()` は最後の状態を返します（`runner.result` にも残ります）。`End()` に着いたら `End()`、ユーザーがアプリをやめたら `base.QUIT`（そのときの状態は `current_state`）。終了時のコールバックは要りません。GUIはウィンドウを閉じると、CUIは Ctrl-C、選択プロンプトやキャンセルできないステップでのEOFで、短いメッセージを出してトレースバック無しに `run()` を抜けます（EOFが2回続いた場合も。パイプ入力が尽きたときに同じフローを繰り返さないため）。ScriptedRunnerは答え `base.QUIT`。`runtime.run()` はこれまで通りRunnerを返します。
+- **グローバルコマンド**: `begin(base.State)`（基底クラス）のコマンドは `End` 以外の全ての状態（`Start` を含む）で選べます。例: `base.Read("bye", name="quit").begin_end(base.State, base.End())`。ただし `Start` にコマンドがあると、Startのフローは自動実行されず選択になります。
+- **コマンドの別名 (command)**: `Read(..., name="edit-name", command="e")` のように短い名前を付けられます（既定は `name`）。CUIは別名・名前・一意な前方一致（`pro` → profile）を受け付け、選択肢には別名を表示します。ScriptedRunnerは名前か別名。GUIのボタンは名前（別名はツールチップ）。
+- **環境適応レイアウト**: レイアウトはアプリでは指定しません。GUIは各画面を「ラベル｜入力欄」の行で並べ、ウィンドウ幅が720px以上で行が2つ以上なら2列に組み替えます（リサイズで切り替わる）。Enterは次の欄へ、最後の欄（またはNextボタン）では「次へ」。CUIはReadの文を端末幅で折り返し、Combineの入力欄に `[1]` `[2]` と番号を付けます。
 - **Branch (分岐)**: `Branch(check, candidates)` をフローの `end` に置くと、`check(data)` が返したStateへ進みます。返り値は `candidates` のどれか（`Return()` も可）でなければエラーになります。
 - **DataContext**: 状態間で共有されるデータコンテキストです。`data_update`（書き込み）と `context_build`（読み出し・構築）を通じて、型安全にデータを扱えます。`context_build` の文字列は `{name}` を含めばテンプレート、含まなければ「dataの属性/キー名ならその値、そうでなければそのままの文」です。
 
@@ -80,10 +89,10 @@ runtime.run(build_app, data)  # CUI/GUIはアプリのコードでは選ばな�
 プロジェクトは以下のレイヤーで構成されています。
 
 1.  **Core (`base.py`)**: State・MiniFlow（`Read`, `Write`, `Choice`, `Combine`, `LinearCombine`）とデータ管理ロジックを保持します。MiniFlowは描画方法を持たない純粋なデータです。Runner基底クラス（`ApplicationRunnerBase`）がステートマシンのループを回し、各MiniFlowを種類ごとの描画メソッド（`show_read`, `show_write`, ...）に振り分けます。特定のプラットフォームには依存しません。
-    - `runner.describe()`: 状態・明示的なフロー・Branchの分岐先・状態ごとのコマンドを文字列で一覧にします。
-    - `runner.validate()`: 実行せずにグラフを検査し、問題のリストを返します（Startから始まるフローが無い、行き止まりの状態、Startから到達できない状態、行き先の無いBranch候補、どの状態にも当てはまらないコマンド）。コマンドもその型の状態からの出口として数えます。`run()` は最初に `validate()` を呼び、問題があれば警告を出して（止めずに）実行します。
+    - `runner.describe()`: 状態・明示的なフロー・Branchの分岐先・状態ごとのコマンド（別名があれば `別名 (名前)`）、キャンセル可能なフローの `[cancellable]` 印、各フロー内のWriteとそのkindを文字列で一覧にします。
+    - `runner.validate()`: 実行せずにグラフを検査し、問題のリストを返します（Startから始まるフローが無い、行き止まりの状態、Startから到達できない状態、行き先の無いBranch候補、どの状態にも当てはまらないコマンド、同じ状態で同じ別名のコマンド）。コマンドもその型の状態からの出口として数えます。`run()` は最初に `validate()` を呼び、問題があれば警告を出して（止めずに）実行します。
 2.  **Backends (`gui.py`, `cui.py`, `scripted.py`)**: Runner（`GuiRunner`, `CuiRunner`, `ScriptedRunner`）だけを提供し、描画メソッドを具体的なUI部品（QWidgetやprint/input）で実装します。`Combine`の子をまとめて表示する処理と、kindに合ったウィジェットの選択・入力の変換と再入力もRunnerが担当します。
-    - `ScriptedRunner(data, answers)`: 画面を持たないRunnerです。`answers` を先頭から順に使い（Writeには入力文字列または `30` / `True` のような値、Choiceには選択肢の値、選択にはフロー名/コマンド名）、表示された内容を `transcript` に記録します。Writeの答えはkindとvalidateで変換・検査され、拒否されると `base.InvalidInput` を送出します。答えが足りなくなると `ScriptExhausted` を送出します。テスト（`tests/`）で使っています。
+    - `ScriptedRunner(data, answers)`: 画面を持たないRunnerです。`answers` を先頭から順に使い（Writeには入力文字列または `30` / `True` のような値、Choiceには選択肢の値、選択にはフロー名/コマンド名）、表示された内容を `transcript` に記録します。Writeの答えはkindとvalidateで変換・検査され、拒否されると `base.InvalidInput` を送出します。答えが足りなくなると `ScriptExhausted` を送出します。`on_reject="next"` にすると、拒否された答えは `("rejected", 名前, メッセージ)` として記録し、次の答えを使います（聞き直しの経路をテストできる。既定は `"raise"`）。テスト（`tests/`）で使っています。
 3.  **Runtime選択 (`runtime.py`)**: `runtime.run(build_app, data)` がRunnerを選んで実行します。優先順位は 引数 `backend` > コマンドライン `--cui` / `--gui` > 環境変数 `FLOW_UI_BACKEND`（`cui` / `gui`） > 自動判定（PySide6が読み込めて画面がある場合はGUI、Linuxでは `DISPLAY` か `WAYLAND_DISPLAY` が必要。それ以外はCUI。画面はあるのにPySide6が読み込めなかったときは、理由を標準エラー出力に1行出してCUIにします）。PySide6はGUIを選んだときだけ読み込みます。
 4.  **App Logic (`main.py`, `login_example.py`)**: 開発者が`base`のクラスだけでフローを記述し、`build_app(runner)` でRunnerにフローを登録します。アプリのコードは `cui` / `gui` を直接importしないので、同一のロジックを異なる環境で動作させることができます。
 

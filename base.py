@@ -80,6 +80,45 @@ class Return:
         return "Return()"
 
 
+class Quit:
+    """What `run()` returns when the user quit the app (closed the window, Ctrl-C, EOF where nothing could be
+    cancelled). `Quit()` is always the same object, also available as `QUIT`. It is not a State."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "Quit()"
+
+
+QUIT = Quit()
+
+
+class _Sentinel:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __repr__(self):
+        return self.name
+
+
+CANCEL: Any = _Sentinel("CANCEL")
+"""ScriptedRunner answer meaning "the user cancels the running flow here"."""
+
+
+class Cancelled(Exception):
+    """Raised by a runner while a cancellable flow runs: the user abandoned it. `run()` catches it and goes
+    back to the state the flow began at, without evaluating its end."""
+
+
+class UserQuit(Exception):
+    """Raised by a runner when the user quits the app. `run()` catches it and returns `QUIT`."""
+
+
 class Branch:
     """End of a flow that splits: `check(data)` returns one of the declared `candidates`."""
 
@@ -273,6 +312,8 @@ class MiniFlow:
 
     Constructor: `Read("message", name=...)` (begin/end set later with `begin`/`begin_end` or as keywords),
     or the old positional form `Read(begin, end, "message", "name")`. Without a name, the message is used.
+    cancellable: whether the user may abandon the flow midway (default: True for command flows only).
+    command: optional short name for a command flow (default: `name`).
     """
 
     def __init__(
@@ -282,10 +323,14 @@ class MiniFlow:
         end_state: Union[State, Branch, Return, None] = _UNSET,
         message: str = _UNSET,
         name: Optional[str] = _UNSET,
+        cancellable: Optional[bool] = None,
+        command: Optional[str] = None,
     ):
-        self.message = self._setup(args, begin_state, end_state, name, "message", message, "")
+        self.message = self._setup(args, begin_state, end_state, name, "message", message, "", cancellable, command)
 
-    def _setup(self, args, begin_state, end_state, name, content_key: str, content, default):
+    def _setup(
+        self, args, begin_state, end_state, name, content_key: str, content, default, cancellable=None, command=None
+    ):
         """Bind positional arguments (short or old form) and set the common attributes. Returns the content."""
         given = _bind_args(
             type(self).__name__,
@@ -300,6 +345,10 @@ class MiniFlow:
         name = None if given["name"] is _UNSET else given["name"]
         self.name = name or (message if isinstance(message, str) else "") or type(self).__name__
         self.message = message
+        self.cancellable = cancellable
+        if command is not None and (not isinstance(command, str) or not command.strip() or " " in command.strip()):
+            raise TypeError(f"command must be a short name without spaces, not {command!r}")
+        self._command = None if command is None else command.strip()
 
         # Data handling
         self._data_update_func: Optional[Union[Callable, str]] = None
@@ -322,6 +371,23 @@ class MiniFlow:
     @property
     def is_command(self) -> bool:
         return isinstance(self.begin_state, type)
+
+    @property
+    def cancellable(self) -> bool:
+        """Whether the user may abandon this flow midway. Default: True for command flows, False otherwise.
+        Set with `cancellable=` in the constructor (or assign the attribute); None restores the default."""
+        if self._cancellable is None:
+            return self.is_command
+        return self._cancellable
+
+    @cancellable.setter
+    def cancellable(self, value: Optional[bool]):
+        self._cancellable = None if value is None else bool(value)
+
+    @property
+    def command(self) -> str:
+        """The short name typed (CUI) or matched (ScriptedRunner) to pick this command flow. Default: `name`."""
+        return self._command or self.name
 
     def data_update(
         self,
@@ -379,13 +445,37 @@ class ApplicationRunnerBase(abc.ABC):
         self.start_state: Optional[Start] = None
         self.current_state: Optional[State] = None
         self.data = data
+        self.active_flow: Optional[MiniFlow] = None
+        self.result: Any = None
 
     def add_miniflow(self, flow: MiniFlow):
         self.flows.append(flow)
         if isinstance(flow.begin_state, Start):
             self.start_state = flow.begin_state
 
-    def run(self):
+    def run(self) -> Any:
+        """Run the app from Start. Returns the final state: `End()` when the app reached End, `QUIT` when the
+        user quit (the state they were at stays in `current_state`), or the state that had no flow to run.
+        The value is also kept in `self.result`."""
+        try:
+            self._loop()
+        except UserQuit:
+            self.result = QUIT
+        else:
+            self.result = self.current_state
+        finally:
+            self.active_flow = None
+        return self.result
+
+    @property
+    def can_cancel(self) -> bool:
+        """Whether the flow that is running now (the one chosen at the current state) may be cancelled."""
+        return self.active_flow is not None and self.active_flow.cancellable
+
+    def cancelled(self, flow: "MiniFlow"):
+        """Called after the user cancelled `flow` (the state is back at where it began). Backends may override."""
+
+    def _loop(self):
         problems = self.validate()
         if problems:
             self.warn(problems)
@@ -411,7 +501,16 @@ class ApplicationRunnerBase(abc.ABC):
                 selected_flow = self.select_flow(flows, commands)
 
             origin = self.current_state
-            self.render(selected_flow)
+            self.active_flow = selected_flow
+            try:
+                self.render(selected_flow)
+            except Cancelled:
+                # Updates of steps that already finished stay; the end (Branch etc.) is not evaluated.
+                self.current_state = origin
+                self.cancelled(selected_flow)
+                continue
+            finally:
+                self.active_flow = None
             self.current_state = self.resolve_end(selected_flow.end_state, origin)
 
     def flows_for(self, state: State) -> tuple[list[MiniFlow], list[MiniFlow]]:
@@ -462,21 +561,29 @@ class ApplicationRunnerBase(abc.ABC):
         return list(result)
 
     def describe(self) -> str:
-        """Text listing of the graph: states, explicit flows, Branch candidates and commands."""
+        """Text listing of the graph: states, explicit flows, Branch candidates and commands.
+
+        Commands with a `command` alias are shown as `alias (name)`. A flow the user may cancel is marked
+        `[cancellable]`. Under each flow, every Write it contains is listed with its kind.
+        """
         lines = ["States:"]
         for st in self.states():
             flows, commands = self.flows_for(st)
-            extra = f"  commands: {', '.join(c.name for c in commands)}" if commands else ""
+            extra = f"  commands: {', '.join(_command_label(c) for c in commands)}" if commands else ""
             lines.append(f"  {st!r}{extra}")
         lines.append("Flows:")
         for f in self.flows:
             if not f.is_command:
-                lines.append(f"  {f.name}: {f.begin_state!r} -> {_describe_end(f.end_state)}")
+                lines.append(f"  {f.name}: {f.begin_state!r} -> {_describe_end(f.end_state)}{_flags(f)}")
+                lines.extend(_describe_writes(f))
         commands = [f for f in self.flows if f.is_command]
         if commands:
             lines.append("Commands:")
             for c in commands:
-                lines.append(f"  {c.name}: any {c.begin_state.__name__} -> {_describe_end(c.end_state)}")
+                lines.append(
+                    f"  {_command_label(c)}: any {c.begin_state.__name__} -> {_describe_end(c.end_state)}{_flags(c)}"
+                )
+                lines.extend(_describe_writes(c))
         return "\n".join(lines)
 
     def validate(self) -> list[str]:
@@ -508,6 +615,13 @@ class ApplicationRunnerBase(abc.ABC):
             if isinstance(st, End):
                 continue
             flows, commands = self.flows_for(st)
+            seen_commands: dict[str, str] = {}
+            for c in commands:
+                if c.command in seen_commands:
+                    problems.append(
+                        f"commands '{seen_commands[c.command]}' and '{c.name}' are both typed as '{c.command}' at {st!r}"
+                    )
+                seen_commands.setdefault(c.command, c.name)
             if flows or commands:
                 continue
             if st in branch_targets:
@@ -574,6 +688,25 @@ def _end_targets(end) -> list:
     return [end]
 
 
+def _command_label(flow: "MiniFlow") -> str:
+    return flow.name if flow.command == flow.name else f"{flow.command} ({flow.name})"
+
+
+def _flags(flow: "MiniFlow") -> str:
+    return "  [cancellable]" if flow.cancellable else ""
+
+
+def _describe_writes(flow: "MiniFlow", depth: int = 2) -> list[str]:
+    """One line per Write inside `flow` (itself included): `Write 'name': kind`."""
+    if isinstance(flow, Write):
+        return [f"{'  ' * depth}Write '{flow.name}': {flow.kind!r}"]
+    lines: list[str] = []
+    if isinstance(flow, (Combine, LinearCombine)):
+        for child in flow.flows:
+            lines.extend(_describe_writes(child, depth))
+    return lines
+
+
 def _describe_end(end) -> str:
     if end is None or end is Return():
         return "Return (back to where it began)"
@@ -604,8 +737,13 @@ class Write(MiniFlow):
         name: Optional[str] = _UNSET,
         kind: Union[Kind, type, None] = None,
         validate: Optional[Callable[..., Optional[str]]] = None,
+        cancellable: Optional[bool] = None,
+        command: Optional[str] = None,
     ):
-        super().__init__(*args, begin_state=begin_state, end_state=end_state, message=message, name=name)
+        super().__init__(
+            *args, begin_state=begin_state, end_state=end_state, message=message, name=name,
+            cancellable=cancellable, command=command,
+        )
         self.kind = _as_kind(kind)
         self.validator = validate
 
@@ -629,19 +767,25 @@ class Write(MiniFlow):
 class Choice(MiniFlow):
     """The user picks one of `choices`. `Choice(["a", "b"], name=...)`; old form `Choice(begin, end, choices, name)`."""
 
-    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, choices=_UNSET, name=_UNSET):
-        self.choices = self._setup(args, begin_state, end_state, name, "choices", choices, ())
+    def __init__(
+        self, *args: Any, begin_state=_UNSET, end_state=_UNSET, choices=_UNSET, name=_UNSET, cancellable=None, command=None
+    ):
+        self.choices = self._setup(args, begin_state, end_state, name, "choices", choices, (), cancellable, command)
 
 
 class Combine(MiniFlow):
     """Child steps shown together (one screen in a GUI). `Combine([...], name=...)`. Children may be any step."""
 
-    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET):
-        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, ())
+    def __init__(
+        self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET, cancellable=None, command=None
+    ):
+        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, (), cancellable, command)
 
 
 class LinearCombine(MiniFlow):
     """Child steps run one after another. `LinearCombine([...], name=...)`. Children may be any step."""
 
-    def __init__(self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET):
-        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, ())
+    def __init__(
+        self, *args: Any, begin_state=_UNSET, end_state=_UNSET, flows=_UNSET, name=_UNSET, cancellable=None, command=None
+    ):
+        self.flows = self._setup(args, begin_state, end_state, name, "flows", flows, (), cancellable, command)
